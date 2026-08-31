@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import { Fraunces, Work_Sans, UnifrakturCook, Give_You_Glory } from "next/font/google";
-// @ts-expect-error - Next.js handles CSS imports
 import "./globals.css";
 
 const display = Fraunces({

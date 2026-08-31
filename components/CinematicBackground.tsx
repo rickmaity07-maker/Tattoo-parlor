@@ -21,15 +21,14 @@ export default function CinematicBackground() {
 
     const observer = new IntersectionObserver(
       (entries) => {
-        let best: { id: string; ratio: number } | null = null;
-        entries.forEach((entry) => {
-          const id = entry.target.getAttribute("data-bg");
-          if (!id || !entry.isIntersecting) return;
-          if (!best || entry.intersectionRatio > best.ratio) {
-            best = { id, ratio: entry.intersectionRatio };
-          }
-        });
-        if (best) setActive(best.id);
+        const visible = entries
+          .filter((entry) => entry.isIntersecting && entry.target.getAttribute("data-bg"))
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
+
+        const top = visible[0];
+        if (!top) return;
+        const id = top.target.getAttribute("data-bg");
+        if (id) setActive(id);
       },
       { threshold: [0.2, 0.4, 0.6], rootMargin: "-12% 0px -12% 0px" }
     );
@@ -56,7 +55,6 @@ export default function CinematicBackground() {
                 alt=""
                 className="h-full w-full object-cover img-cinematic animate-drift"
               />
-              {/* Much heavier mood overlays */}
               <div className="absolute inset-0 bg-black/70" />
               <div className="absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black/85" />
               <div className="absolute inset-0 bg-gradient-to-r from-black/40 via-transparent to-black/30" />

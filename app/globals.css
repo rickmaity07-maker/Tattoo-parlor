@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background-color: #030302;
+  color: #E8E0D4;
+  cursor: none;
+  height: 100%;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(139, 46, 58, 0.4);
+  color: #E8E0D4;
+}
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.img-cinematic {
+  filter: contrast(1.08) saturate(0.82) brightness(0.88);
+}
+
+.vignette-heavy {
+  box-shadow: inset 0 0 180px 40px rgba(0, 0, 0, 0.65);
+}
+
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 1px solid rgba(196, 165, 116, 0.5);
+  outline-offset: 3px;
+}
+
+.snap-y-mandatory {
+  scroll-snap-type: y mandatory;
+  overflow-y: auto;
+  height: 100svh;
+}
+
+.snap-section {
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  min-height: 100svh;
+  height: 100svh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+section[id] {
+  scroll-margin-top: 0;
+}

@@ -7,28 +7,28 @@ export default function Artists() {
     <section
       id="artists"
       data-bg="artists"
-      className="snap-section z-10 w-full px-6 md:px-10 lg:px-14"
+      className="snap-section z-10 w-full px-4 sm:px-6 md:px-10 lg:px-14"
       data-allow-scroll
     >
-      <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col justify-center py-24 md:py-28">
-        <div className="mb-6 shrink-0 text-center md:mb-8">
-          <p className="mb-2 text-[11px] uppercase tracking-[0.35em] text-rose/80">Artists</p>
-          <h2 className="font-display text-3xl font-medium text-parchment md:text-4xl lg:text-5xl">
+      <div className="mx-auto flex h-full w-full max-w-6xl flex-col justify-center py-6 md:py-8">
+        <div className="mb-4 shrink-0 text-center md:mb-5">
+          <p className="mb-1.5 text-[10px] uppercase tracking-[0.35em] text-rose/80 md:text-[11px]">Artists</p>
+          <h2 className="font-display text-2xl font-medium text-parchment sm:text-3xl md:text-4xl">
             Who holds the machine.
           </h2>
         </div>
 
-        <div className="grid w-full grid-cols-1 gap-8 md:grid-cols-2 md:gap-12 lg:gap-16">
+        <div className="grid w-full grid-cols-1 gap-8 sm:gap-6 md:grid-cols-2 md:gap-10 lg:gap-14">
           {artists.map((artist, i) => (
             <motion.article
               key={artist.name}
-              initial={{ opacity: 0, y: 12 }}
+              initial={{ opacity: 0, y: 10 }}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true }}
-              transition={{ duration: 0.6, delay: i * 0.08 }}
+              transition={{ duration: 0.55, delay: i * 0.08 }}
               className="flex flex-col items-center text-center"
             >
-              <div className="relative mb-4 h-[28vh] max-h-[260px] w-full max-w-[220px] overflow-hidden rounded-sm sm:max-w-[240px] md:h-[32vh] md:max-h-[300px] md:max-w-[280px]">
+              <div className="relative mb-3 h-[20vh] max-h-[200px] w-full max-w-[160px] overflow-hidden rounded-sm sm:max-w-[180px] md:h-[26vh] md:max-h-[260px] md:max-w-[240px]">
                 <img
                   src={artist.image}
                   alt={artist.name}
@@ -36,13 +36,13 @@ export default function Artists() {
                 />
                 <div className="absolute inset-0 bg-gradient-to-t from-black/40 to-transparent" />
               </div>
-              <h3 className="font-display text-2xl text-parchment md:text-3xl">
+              <h3 className="font-display text-xl text-parchment md:text-2xl lg:text-3xl">
                 {artist.name}
               </h3>
-              <p className="mt-1.5 text-[10px] uppercase tracking-[0.28em] text-brass">
+              <p className="mt-1 text-[9px] uppercase tracking-[0.28em] text-brass sm:text-[10px]">
                 {artist.role}
               </p>
-              <p className="mt-3 max-w-xs text-sm leading-relaxed text-parchment/55 md:max-w-sm">
+              <p className="mt-2 max-w-xs text-xs leading-relaxed text-parchment/55 sm:text-sm">
                 {artist.bio}
               </p>
             </motion.article>

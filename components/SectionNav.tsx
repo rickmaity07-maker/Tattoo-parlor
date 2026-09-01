@@ -19,6 +19,15 @@ export default function SectionNav({ autoMs = 0 }: Props) {
   const indexRef = useRef(0);
   const locked = useRef(false);
   const [auto, setAuto] = useState(false);
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    const fine = window.matchMedia("(hover: hover) and (pointer: fine) and (min-width: 768px)");
+    setEnabled(fine.matches);
+    const onChange = () => setEnabled(fine.matches);
+    fine.addEventListener("change", onChange);
+    return () => fine.removeEventListener("change", onChange);
+  }, []);
 
   const goTo = (i: number) => {
     const next = Math.max(0, Math.min(SECTIONS.length - 1, i));
@@ -30,6 +39,7 @@ export default function SectionNav({ autoMs = 0 }: Props) {
   };
 
   useEffect(() => {
+    if (!enabled) return;
     const obs = new IntersectionObserver(
       (entries) => {
         const best = entries
@@ -46,17 +56,16 @@ export default function SectionNav({ autoMs = 0 }: Props) {
       if (el) obs.observe(el);
     });
     return () => obs.disconnect();
-  }, []);
+  }, [enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     const onWheel = (e: WheelEvent) => {
       const t = e.target as HTMLElement;
       if (t.closest("textarea, input, select, [data-allow-scroll]")) return;
-
       const dir = e.deltaY > 0 ? 1 : -1;
       const nextId = SECTIONS[indexRef.current + dir];
-      if (!nextId || !document.getElementById(nextId)) return; // normal scroll
-
+      if (!nextId || !document.getElementById(nextId)) return;
       e.preventDefault();
       if (locked.current) return;
       locked.current = true;
@@ -67,13 +76,13 @@ export default function SectionNav({ autoMs = 0 }: Props) {
     };
     window.addEventListener("wheel", onWheel, { passive: false });
     return () => window.removeEventListener("wheel", onWheel);
-  }, []);
+  }, [enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     const onKey = (e: KeyboardEvent) => {
       if (["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement)?.tagName)) return;
       if (locked.current) return;
-
       let dir = 0;
       if (["ArrowDown", "PageDown", " "].includes(e.key)) dir = 1;
       if (["ArrowUp", "PageUp"].includes(e.key)) dir = -1;
@@ -88,10 +97,8 @@ export default function SectionNav({ autoMs = 0 }: Props) {
         return;
       }
       if (!dir) return;
-
       const nextId = SECTIONS[indexRef.current + dir];
       if (!nextId || !document.getElementById(nextId)) return;
-
       e.preventDefault();
       locked.current = true;
       goTo(indexRef.current + dir);
@@ -101,10 +108,10 @@ export default function SectionNav({ autoMs = 0 }: Props) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [enabled]);
 
   useEffect(() => {
-    if (!auto || autoMs <= 0) return;
+    if (!enabled || !auto || autoMs <= 0) return;
     const id = window.setInterval(() => {
       if (locked.current) return;
       const next = indexRef.current + 1;
@@ -112,10 +119,12 @@ export default function SectionNav({ autoMs = 0 }: Props) {
       else goTo(next);
     }, autoMs);
     return () => window.clearInterval(id);
-  }, [auto, autoMs]);
+  }, [auto, autoMs, enabled]);
+
+  if (!enabled) return null;
 
   return (
-    <div className="fixed bottom-6 right-6 z-[60] flex items-center gap-2">
+    <div className="fixed bottom-6 right-6 z-[60] hidden items-center gap-2 md:flex">
       <button
         type="button"
         onClick={() => setAuto((v) => !v)}

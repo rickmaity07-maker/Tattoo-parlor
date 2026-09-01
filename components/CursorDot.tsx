@@ -3,39 +3,35 @@ import { useEffect, useState } from "react";
 import { motion, useSpring } from "framer-motion";
 
 export default function CursorDot() {
-  const [pos, setPos] = useState({ x: 0, y: 0 });
   const [visible, setVisible] = useState(false);
+  const x = useSpring(0, { stiffness: 400, damping: 35 });
+  const y = useSpring(0, { stiffness: 400, damping: 35 });
 
   useEffect(() => {
+    const fine = window.matchMedia("(hover: hover) and (pointer: fine)");
+    if (!fine.matches) return;
+
+    setVisible(true);
     const move = (e: MouseEvent) => {
-      setPos({ x: e.clientX, y: e.clientY });
-      setVisible(true);
+      x.set(e.clientX);
+      y.set(e.clientY);
     };
-    const leave = () => setVisible(false);
     window.addEventListener("mousemove", move);
-    document.addEventListener("mouseleave", leave);
+    const onChange = () => setVisible(fine.matches);
+    fine.addEventListener("change", onChange);
     return () => {
       window.removeEventListener("mousemove", move);
-      document.removeEventListener("mouseleave", leave);
+      fine.removeEventListener("change", onChange);
     };
-  }, []);
-
-  const spring = { damping: 28, stiffness: 380, mass: 0.4 };
-  const x = useSpring(pos.x, spring);
-  const y = useSpring(pos.y, spring);
+  }, [x, y]);
 
   if (!visible) return null;
 
   return (
-    <>
-      <motion.div
-        style={{ x: pos.x - 3, y: pos.y - 3 }}
-        className="pointer-events-none fixed top-0 left-0 z-[9999] hidden h-1.5 w-1.5 rounded-full bg-parchment md:block"
-      />
-      <motion.div
-        style={{ x, y }}
-        className="pointer-events-none fixed top-0 left-0 z-[9998] hidden h-9 w-9 -translate-x-1/2 -translate-y-1/2 rounded-full border border-parchment/35 md:block"
-      />
-    </>
+    <motion.div
+      aria-hidden
+      className="pointer-events-none fixed left-0 top-0 z-[9999] hidden h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-parchment/80 mix-blend-difference md:block"
+      style={{ x, y }}
+    />
   );
 }

@@ -353,3 +353,176 @@ export default function VirtualTryOn() {
           ref={containerRef}
           className="relative mx-auto aspect-[3/4] w-full max-w-2xl overflow-hidden rounded-sm border border-white/10 bg-charcoal sm:aspect-[4/5] md:aspect-video md:max-h-[65vh]"
         >
+          <video
+            ref={videoRef}
+            playsInline
+            muted
+            autoPlay
+            className={`absolute inset-0 h-full w-full object-cover ${
+              mirrorVideo ? "scale-x-[-1]" : ""
+            }`}
+          />
+
+          {activeUrl && (
+            <img
+              src={activeUrl}
+              alt="Stencil"
+              draggable={false}
+              className={`absolute z-10 max-w-none touch-none select-none mix-blend-multiply ${
+                manual
+                  ? "cursor-grab active:cursor-grabbing"
+                  : "pointer-events-none"
+              }`}
+              style={stencilStyle()}
+              onPointerDown={
+                manual
+                  ? (ev) => {
+                      const el = containerRef.current;
+                      if (!el) return;
+                      const rect = el.getBoundingClientRect();
+                      const move = (e: PointerEvent) => {
+                        let x = (e.clientX - rect.left) / rect.width;
+                        if (mirrorVideo) x = 1 - x;
+                        const y = (e.clientY - rect.top) / rect.height;
+                        setManualPos({
+                          x: Math.min(0.95, Math.max(0.05, x)),
+                          y: Math.min(0.95, Math.max(0.05, y)),
+                        });
+                      };
+                      const up = () => {
+                        window.removeEventListener("pointermove", move);
+                        window.removeEventListener("pointerup", up);
+                      };
+                      window.addEventListener("pointermove", move);
+                      window.addEventListener("pointerup", up);
+                      move(ev.nativeEvent);
+                    }
+                  : undefined
+              }
+            />
+          )}
+
+          {!tracking && (
+            <div className="absolute inset-0 flex items-center justify-center bg-charcoal/80">
+              <button
+                type="button"
+                onClick={() => startCamera(facing)}
+                className="rounded-full bg-parchment px-6 py-3 text-[11px] uppercase tracking-[0.25em] text-void"
+              >
+                Enable camera
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="mx-auto mt-5 max-w-2xl">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-[10px] uppercase tracking-[0.3em] text-parchment/40">
+              Designs
+            </p>
+            <label className="cursor-pointer rounded-full border border-parchment/25 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-parchment/70 transition hover:border-parchment/50">
+              Upload your design
+              <input
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                className="hidden"
+                onChange={onDesignUpload}
+              />
+            </label>
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-2">
+            {flashes.map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => setActiveUrl(f.url)}
+                className={`h-20 w-20 shrink-0 overflow-hidden rounded-sm border sm:h-24 sm:w-24 ${
+                  activeUrl === f.url
+                    ? "border-parchment/60"
+                    : "border-white/10 opacity-55"
+                }`}
+              >
+                <img
+                  src={f.url}
+                  alt={f.label}
+                  className="h-full w-full object-cover img-cinematic grayscale"
+                />
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mx-auto mt-5 max-w-md space-y-4 rounded-sm border border-white/8 bg-charcoal/50 p-4">
+          <label className="flex items-center justify-between gap-3 text-[11px] text-parchment/60">
+            <span>Manual drag (override tracking)</span>
+            <input
+              type="checkbox"
+              checked={manual}
+              onChange={(e) => setManual(e.target.checked)}
+              className="h-4 w-4 accent-rose"
+            />
+          </label>
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
+              <span>Size</span>
+              <span className="text-brass">{Math.round(scaleMul * 100)}%</span>
+            </div>
+            <input
+              type="range"
+              min="0.4"
+              max="2.2"
+              step="0.05"
+              value={scaleMul}
+              onChange={(e) => setScaleMul(parseFloat(e.target.value))}
+              className="w-full accent-rose"
+            />
+          </div>
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
+              <span>Rotation offset</span>
+              <span className="text-brass">{rotOffset}°</span>
+            </div>
+            <input
+              type="range"
+              min="-90"
+              max="90"
+              step="1"
+              value={rotOffset}
+              onChange={(e) => setRotOffset(parseFloat(e.target.value))}
+              className="w-full accent-rose"
+            />
+          </div>
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
+              <span>Opacity</span>
+              <span className="text-brass">{Math.round(opacity * 100)}%</span>
+            </div>
+            <input
+              type="range"
+              min="0.4"
+              max="1"
+              step="0.05"
+              value={opacity}
+              onChange={(e) => setOpacity(parseFloat(e.target.value))}
+              className="w-full accent-rose"
+            />
+          </div>
+        </div>
+
+        <p className="mx-auto mt-6 max-w-lg text-center text-[11px] leading-relaxed text-parchment/35">
+          Front camera is mirrored (selfie). Back camera is natural for pointing
+          at your arm. Desktop webcams usually only have a front camera.
+        </p>
+
+        <div className="mt-6 flex justify-center">
+          <a
+            href="/#reserve"
+            className="inline-flex min-h-[48px] items-center rounded-full bg-parchment px-8 py-3 text-[11px] font-medium uppercase tracking-[0.25em] text-void"
+          >
+            Reserve a session
+          </a>
+        </div>
+      </div>
+    </section>
+  );
+}

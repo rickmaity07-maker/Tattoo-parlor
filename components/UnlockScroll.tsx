@@ -1,7 +1,6 @@
 "use client";
 import { useEffect } from "react";
 
-/** Restores normal page scroll (home uses overflow:hidden for snap). */
 export default function UnlockScroll() {
   useEffect(() => {
     const html = document.documentElement;

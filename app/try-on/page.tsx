@@ -7,7 +7,7 @@ import UnlockScroll from "@/components/UnlockScroll";
 
 export const metadata = {
   title: "Virtual Try-On — Iron Rose Tattoo Co.",
-  description: "Upload a photo and place digital flash before your appointment.",
+  description: "Live arm tracking stencil preview with custom design upload.",
 };
 
 export default function TryOnPage() {

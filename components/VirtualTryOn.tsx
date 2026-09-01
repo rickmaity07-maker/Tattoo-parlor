@@ -10,6 +10,7 @@ import {
 } from "react";
 
 type Flash = { id: string; label: string; url: string };
+type Facing = "user" | "environment";
 
 const DEFAULT_FLASH: Flash[] = [
   {
@@ -44,7 +45,6 @@ const WASM_ROOT =
 
 export default function VirtualTryOn() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const landmarkerRef = useRef<any>(null);
@@ -55,6 +55,7 @@ export default function VirtualTryOn() {
   const [tracking, setTracking] = useState(false);
   const [status, setStatus] = useState("Loading tracker…");
   const [error, setError] = useState<string | null>(null);
+  const [facing, setFacing] = useState<Facing>("user");
   const [flashes, setFlashes] = useState<Flash[]>(DEFAULT_FLASH);
   const [activeUrl, setActiveUrl] = useState<string | null>(null);
   const [scaleMul, setScaleMul] = useState(1);
@@ -69,6 +70,8 @@ export default function VirtualTryOn() {
     visible: false,
   });
   const [manualPos, setManualPos] = useState({ x: 0.4, y: 0.35 });
+
+  const mirrorVideo = facing === "user";
 
   const stopCamera = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -86,16 +89,12 @@ export default function VirtualTryOn() {
         setStatus("Loading MediaPipe (GPU)…");
         const vision = await import("@mediapipe/tasks-vision");
         const { FilesetResolver, PoseLandmarker } = vision;
-
         const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
 
         let landmarker: any;
         try {
           landmarker = await PoseLandmarker.createFromOptions(fileset, {
-            baseOptions: {
-              modelAssetPath: MODEL_URL,
-              delegate: "GPU",
-            },
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
             runningMode: "VIDEO",
             numPoses: 1,
           });
@@ -103,10 +102,7 @@ export default function VirtualTryOn() {
         } catch {
           setStatus("GPU unavailable — using CPU…");
           landmarker = await PoseLandmarker.createFromOptions(fileset, {
-            baseOptions: {
-              modelAssetPath: MODEL_URL,
-              delegate: "CPU",
-            },
+            baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
             runningMode: "VIDEO",
             numPoses: 1,
           });
@@ -122,9 +118,7 @@ export default function VirtualTryOn() {
       } catch (e) {
         console.error(e);
         if (!cancelled) {
-          setError(
-            "Could not load arm tracker. Use manual mode or check your connection."
-          );
+          setError("Could not load arm tracker. Use manual mode.");
           setStatus("Tracker failed");
           setReady(true);
         }
@@ -139,35 +133,70 @@ export default function VirtualTryOn() {
     };
   }, []);
 
-  const startCamera = useCallback(async () => {
-    setError(null);
-    try {
-      stopCamera();
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: "user" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
-        audio: false,
-      });
-      streamRef.current = stream;
-      const video = videoRef.current;
-      if (!video) return;
-      video.srcObject = stream;
-      await video.play();
-      setTracking(true);
-      setStatus((s) => (s.includes("ready") ? s : "Camera on"));
-    } catch {
-      setError("Camera blocked. Allow camera access and retry.");
-      setTracking(false);
-    }
-  }, [stopCamera]);
+  const startCamera = useCallback(
+    async (face: Facing = facing) => {
+      setError(null);
+      try {
+        streamRef.current?.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: face },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+        streamRef.current = stream;
+        const video = videoRef.current;
+        if (!video) return;
+        video.srcObject = stream;
+        await video.play();
+        setTracking(true);
+        setStatus((s) =>
+          s.includes("ready") || s.includes("Tracker") ? s : "Camera on"
+        );
+      } catch {
+        try {
+          const alt: Facing = face === "user" ? "environment" : "user";
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: alt },
+            audio: false,
+          });
+          streamRef.current = stream;
+          const video = videoRef.current;
+          if (!video) return;
+          video.srcObject = stream;
+          await video.play();
+          setFacing(alt);
+          setTracking(true);
+          setError(
+            `Preferred camera unavailable — using ${
+              alt === "user" ? "front" : "back"
+            }.`
+          );
+        } catch {
+          setError("Camera blocked or unavailable. Allow camera access and retry.");
+          setTracking(false);
+        }
+      }
+    },
+    [facing]
+  );
 
   useEffect(() => {
-    if (ready) startCamera();
+    if (ready) startCamera(facing);
     return () => stopCamera();
-  }, [ready, startCamera, stopCamera]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  const switchCamera = async (next: Facing) => {
+    if (next === facing) return;
+    setFacing(next);
+    setArm((a) => ({ ...a, visible: false }));
+    await startCamera(next);
+  };
 
   useEffect(() => {
     if (!tracking || !landmarkerRef.current) return;
@@ -199,9 +228,12 @@ export default function VirtualTryOn() {
               const dy = w.y - e.y;
               const length = Math.hypot(dx, dy);
               if (length < 0.05) continue;
-              const angle = -(Math.atan2(dy, dx) * 180) / Math.PI;
+              const angle = mirrorVideo
+                ? -(Math.atan2(dy, dx) * 180) / Math.PI
+                : (Math.atan2(dy, dx) * 180) / Math.PI;
+              const cx = mirrorVideo ? 1 - (e.x + w.x) / 2 : (e.x + w.x) / 2;
               const pose: ArmPose = {
-                cx: 1 - (e.x + w.x) / 2,
+                cx,
                 cy: (e.y + w.y) / 2,
                 angle,
                 length,
@@ -223,18 +255,20 @@ export default function VirtualTryOn() {
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [tracking, manual]);
+  }, [tracking, manual, mirrorVideo]);
 
   const onDesignUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const url = URL.createObjectURL(file);
-    const flash: Flash = {
-      id: `custom-${Date.now()}`,
-      label: file.name.replace(/\.[^.]+$/, "") || "Custom",
-      url,
-    };
-    setFlashes((prev) => [flash, ...prev]);
+    setFlashes((prev) => [
+      {
+        id: `custom-${Date.now()}`,
+        label: file.name.replace(/\.[^.]+$/, "") || "Custom",
+        url,
+      },
+      ...prev,
+    ]);
     setActiveUrl(url);
   };
 
@@ -280,7 +314,9 @@ export default function VirtualTryOn() {
           <p className="mt-2 text-xs text-parchment/45 sm:text-sm">
             {status}
             {arm.visible && !manual ? " · Arm detected" : ""}
-            {!arm.visible && tracking && !manual ? " · Show forearm to camera" : ""}
+            {!arm.visible && tracking && !manual
+              ? " · Show forearm to camera"
+              : ""}
           </p>
         </div>
 
@@ -288,177 +324,32 @@ export default function VirtualTryOn() {
           <p className="mb-3 text-center text-sm text-rose/90">{error}</p>
         )}
 
+        <div className="mb-3 flex justify-center gap-2">
+          <button
+            type="button"
+            onClick={() => switchCamera("user")}
+            className={`min-h-[40px] rounded-full px-4 py-2 text-[10px] uppercase tracking-[0.2em] transition ${
+              facing === "user"
+                ? "bg-parchment text-void"
+                : "border border-parchment/25 text-parchment/55"
+            }`}
+          >
+            Front camera
+          </button>
+          <button
+            type="button"
+            onClick={() => switchCamera("environment")}
+            className={`min-h-[40px] rounded-full px-4 py-2 text-[10px] uppercase tracking-[0.2em] transition ${
+              facing === "environment"
+                ? "bg-parchment text-void"
+                : "border border-parchment/25 text-parchment/55"
+            }`}
+          >
+            Back camera
+          </button>
+        </div>
+
         <div
           ref={containerRef}
           className="relative mx-auto aspect-[3/4] w-full max-w-2xl overflow-hidden rounded-sm border border-white/10 bg-charcoal sm:aspect-[4/5] md:aspect-video md:max-h-[65vh]"
         >
-          <video
-            ref={videoRef}
-            playsInline
-            muted
-            autoPlay
-            className="absolute inset-0 h-full w-full scale-x-[-1] object-cover"
-          />
-          <canvas ref={canvasRef} className="pointer-events-none absolute inset-0 hidden" />
-
-          {activeUrl && (
-            <img
-              src={activeUrl}
-              alt="Stencil"
-              draggable={false}
-              className={`absolute z-10 max-w-none touch-none select-none mix-blend-multiply ${
-                manual ? "cursor-grab active:cursor-grabbing" : "pointer-events-none"
-              }`}
-              style={stencilStyle()}
-              onPointerDown={
-                manual
-                  ? (ev) => {
-                      const el = containerRef.current;
-                      if (!el) return;
-                      const rect = el.getBoundingClientRect();
-                      const move = (e: PointerEvent) => {
-                        const x = 1 - (e.clientX - rect.left) / rect.width;
-                        const y = (e.clientY - rect.top) / rect.height;
-                        setManualPos({
-                          x: Math.min(0.95, Math.max(0.05, x)),
-                          y: Math.min(0.95, Math.max(0.05, y)),
-                        });
-                      };
-                      const up = () => {
-                        window.removeEventListener("pointermove", move);
-                        window.removeEventListener("pointerup", up);
-                      };
-                      window.addEventListener("pointermove", move);
-                      window.addEventListener("pointerup", up);
-                      move(ev.nativeEvent);
-                    }
-                  : undefined
-              }
-            />
-          )}
-
-          {!tracking && (
-            <div className="absolute inset-0 flex items-center justify-center bg-charcoal/80">
-              <button
-                type="button"
-                onClick={startCamera}
-                className="rounded-full bg-parchment px-6 py-3 text-[11px] uppercase tracking-[0.25em] text-void"
-              >
-                Enable camera
-              </button>
-            </div>
-          )}
-        </div>
-
-        <div className="mx-auto mt-5 max-w-2xl">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <p className="text-[10px] uppercase tracking-[0.3em] text-parchment/40">
-              Designs
-            </p>
-            <label className="cursor-pointer rounded-full border border-parchment/25 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-parchment/70 transition hover:border-parchment/50">
-              Upload your design
-              <input
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/svg+xml"
-                className="hidden"
-                onChange={onDesignUpload}
-              />
-            </label>
-          </div>
-          <div className="flex gap-2 overflow-x-auto pb-2">
-            {flashes.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                onClick={() => setActiveUrl(f.url)}
-                className={`h-20 w-20 shrink-0 overflow-hidden rounded-sm border sm:h-24 sm:w-24 ${
-                  activeUrl === f.url
-                    ? "border-parchment/60"
-                    : "border-white/10 opacity-55"
-                }`}
-              >
-                <img
-                  src={f.url}
-                  alt={f.label}
-                  className="h-full w-full object-cover img-cinematic grayscale"
-                />
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="mx-auto mt-5 max-w-md space-y-4 rounded-sm border border-white/8 bg-charcoal/50 p-4">
-          <label className="flex items-center justify-between gap-3 text-[11px] text-parchment/60">
-            <span>Manual drag (override tracking)</span>
-            <input
-              type="checkbox"
-              checked={manual}
-              onChange={(e) => setManual(e.target.checked)}
-              className="h-4 w-4 accent-rose"
-            />
-          </label>
-          <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
-              <span>Size</span>
-              <span className="text-brass">{Math.round(scaleMul * 100)}%</span>
-            </div>
-            <input
-              type="range"
-              min="0.4"
-              max="2.2"
-              step="0.05"
-              value={scaleMul}
-              onChange={(e) => setScaleMul(parseFloat(e.target.value))}
-              className="w-full accent-rose"
-            />
-          </div>
-          <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
-              <span>Rotation offset</span>
-              <span className="text-brass">{rotOffset}°</span>
-            </div>
-            <input
-              type="range"
-              min="-90"
-              max="90"
-              step="1"
-              value={rotOffset}
-              onChange={(e) => setRotOffset(parseFloat(e.target.value))}
-              className="w-full accent-rose"
-            />
-          </div>
-          <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
-              <span>Opacity</span>
-              <span className="text-brass">{Math.round(opacity * 100)}%</span>
-            </div>
-            <input
-              type="range"
-              min="0.4"
-              max="1"
-              step="0.05"
-              value={opacity}
-              onChange={(e) => setOpacity(parseFloat(e.target.value))}
-              className="w-full accent-rose"
-            />
-          </div>
-        </div>
-
-        <p className="mx-auto mt-6 max-w-lg text-center text-[11px] leading-relaxed text-parchment/35">
-          Uses MediaPipe Pose (GPU when available, CPU fallback). Hold one forearm
-          toward the camera. Upload PNG/JPEG flash — white backgrounds fade with
-          multiply blend. Preview only — not a final stencil.
-        </p>
-
-        <div className="mt-6 flex justify-center">
-          <a
-            href="/#reserve"
-            className="inline-flex min-h-[48px] items-center rounded-full bg-parchment px-8 py-3 text-[11px] font-medium uppercase tracking-[0.25em] text-void"
-          >
-            Reserve a session
-          </a>
-        </div>
-      </div>
-    </section>
-  );
-}

@@ -8,6 +8,7 @@ import {
   ChangeEvent,
   CSSProperties,
 } from "react";
+import { Camera, Download, X, RefreshCw } from "lucide-react";
 
 type Flash = { id: string; label: string; url: string };
 type Facing = "user" | "environment";
@@ -43,6 +44,11 @@ const MODEL_URL =
 const WASM_ROOT =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
 
+// Helper: Angle difference that accounts for wrap-around (-180 to 180)
+function diffAngle(target: number, current: number) {
+  return ((((target - current) % 360) + 540) % 360) - 180;
+}
+
 export default function VirtualTryOn() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -51,16 +57,26 @@ export default function VirtualTryOn() {
   const rafRef = useRef<number>(0);
   const lastVideoTimeRef = useRef(-1);
 
+  // Smooth filter memory
+  const smoothedArmRef = useRef<ArmPose>({
+    cx: 0.5,
+    cy: 0.5,
+    angle: 0,
+    length: 0.2,
+    visible: false,
+  });
+  const lockedArmIndexRef = useRef<number | null>(null); // 0 = left arm, 1 = right arm
+
   const [ready, setReady] = useState(false);
   const [tracking, setTracking] = useState(false);
   const [status, setStatus] = useState("Loading tracker…");
   const [error, setError] = useState<string | null>(null);
   const [facing, setFacing] = useState<Facing>("user");
   const [flashes, setFlashes] = useState<Flash[]>(DEFAULT_FLASH);
-  const [activeUrl, setActiveUrl] = useState<string | null>(null);
+  const [activeUrl, setActiveUrl] = useState<string | null>(DEFAULT_FLASH[0].url);
   const [scaleMul, setScaleMul] = useState(1);
   const [rotOffset, setRotOffset] = useState(0);
-  const [opacity, setOpacity] = useState(0.9);
+  const [opacity, setOpacity] = useState(0.85);
   const [manual, setManual] = useState(false);
   const [arm, setArm] = useState<ArmPose>({
     cx: 0.5,
@@ -69,7 +85,10 @@ export default function VirtualTryOn() {
     length: 0.25,
     visible: false,
   });
-  const [manualPos, setManualPos] = useState({ x: 0.4, y: 0.35 });
+  const [manualPos, setManualPos] = useState({ x: 0.5, y: 0.5 });
+  
+  // Snapshot Modal state
+  const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
 
   const mirrorVideo = facing === "user";
 
@@ -154,32 +173,10 @@ export default function VirtualTryOn() {
         video.srcObject = stream;
         await video.play();
         setTracking(true);
-        setStatus((s) =>
-          s.includes("ready") || s.includes("Tracker") ? s : "Camera on"
-        );
+        setStatus("Camera Active");
       } catch {
-        try {
-          const alt: Facing = face === "user" ? "environment" : "user";
-          const stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: alt },
-            audio: false,
-          });
-          streamRef.current = stream;
-          const video = videoRef.current;
-          if (!video) return;
-          video.srcObject = stream;
-          await video.play();
-          setFacing(alt);
-          setTracking(true);
-          setError(
-            `Preferred camera unavailable — using ${
-              alt === "user" ? "front" : "back"
-            }.`
-          );
-        } catch {
-          setError("Camera blocked or unavailable. Allow camera access and retry.");
-          setTracking(false);
-        }
+        setError("Camera access denied or device unavailable.");
+        setTracking(false);
       }
     },
     [facing]
@@ -188,16 +185,17 @@ export default function VirtualTryOn() {
   useEffect(() => {
     if (ready) startCamera(facing);
     return () => stopCamera();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready]);
+  }, [ready, startCamera, stopCamera, facing]);
 
   const switchCamera = async (next: Facing) => {
     if (next === facing) return;
     setFacing(next);
+    lockedArmIndexRef.current = null;
     setArm((a) => ({ ...a, visible: false }));
     await startCamera(next);
   };
 
+  // Robust Arm Tracker with Hysteresis + LERP
   useEffect(() => {
     if (!tracking || !landmarkerRef.current) return;
 
@@ -214,40 +212,74 @@ export default function VirtualTryOn() {
         try {
           const result = landmarker.detectForVideo(video, performance.now());
           const lm = result?.landmarks?.[0];
+
           if (lm) {
+            // [leftArm: elbow 13, wrist 15], [rightArm: elbow 14, wrist 16]
             const arms = [
-              { e: lm[13], w: lm[15] },
-              { e: lm[14], w: lm[16] },
+              { e: lm[13], w: lm[15], index: 0 },
+              { e: lm[14], w: lm[16], index: 1 },
             ];
-            let best: ArmPose | null = null;
-            for (const { e, w } of arms) {
-              if (!e || !w) continue;
+
+            const candidates = arms.map(({ e, w, index }) => {
+              if (!e || !w) return null;
               const vis = Math.min(e.visibility ?? 1, w.visibility ?? 1);
-              if (vis < 0.45) continue;
               const dx = w.x - e.x;
               const dy = w.y - e.y;
               const length = Math.hypot(dx, dy);
-              if (length < 0.05) continue;
-              const angle = mirrorVideo
-                ? -(Math.atan2(dy, dx) * 180) / Math.PI
-                : (Math.atan2(dy, dx) * 180) / Math.PI;
-              const cx = mirrorVideo ? 1 - (e.x + w.x) / 2 : (e.x + w.x) / 2;
-              const pose: ArmPose = {
-                cx,
-                cy: (e.y + w.y) / 2,
-                angle,
-                length,
+              return { e, w, index, vis, length, dx, dy };
+            }).filter((c): c is NonNullable<typeof c> => c !== null && c.vis > 0.4 && c.length > 0.08);
+
+            let chosen = null;
+            if (candidates.length > 0) {
+              // Stay locked to previous arm if still detected to prevent flipping
+              if (lockedArmIndexRef.current !== null) {
+                chosen = candidates.find((c) => c.index === lockedArmIndexRef.current) || null;
+              }
+              if (!chosen) {
+                // Otherwise choose the most visible/prominent arm
+                chosen = candidates.reduce((prev, curr) => (curr.length > prev.length ? curr : prev));
+                lockedArmIndexRef.current = chosen.index;
+              }
+            } else {
+              lockedArmIndexRef.current = null;
+            }
+
+            if (chosen) {
+              const { e, w, dx, dy, length } = chosen;
+              // Placement: 40% distance down from elbow to wrist (forearm sweet spot)
+              const rawCx = e.x + dx * 0.45;
+              const rawCy = e.y + dy * 0.45;
+              const cx = mirrorVideo ? 1 - rawCx : rawCx;
+              const cy = rawCy;
+
+              let rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
+              if (mirrorVideo) rawAngle = -rawAngle;
+
+              // LERP (Smoothing factor: 0.25 removes jitters, preserves real-time response)
+              const prev = smoothedArmRef.current;
+              const smoothFactor = prev.visible ? 0.25 : 1.0;
+              const dAngle = diffAngle(rawAngle, prev.angle);
+
+              const nextPose: ArmPose = {
+                cx: prev.cx + (cx - prev.cx) * smoothFactor,
+                cy: prev.cy + (cy - prev.cy) * smoothFactor,
+                angle: prev.angle + dAngle * smoothFactor,
+                length: prev.length + (length - prev.length) * smoothFactor,
                 visible: true,
               };
-              if (!best || length > best.length) best = pose;
+
+              smoothedArmRef.current = nextPose;
+              if (!manual) setArm(nextPose);
+            } else {
+              smoothedArmRef.current.visible = false;
+              setArm((a) => ({ ...a, visible: false }));
             }
-            if (best && !manual) setArm(best);
-            else if (!best) setArm((a) => ({ ...a, visible: false }));
           } else {
+            smoothedArmRef.current.visible = false;
             setArm((a) => ({ ...a, visible: false }));
           }
         } catch {
-          // skip frame
+          // ignore detection glitch
         }
       }
       rafRef.current = requestAnimationFrame(tick);
@@ -272,12 +304,13 @@ export default function VirtualTryOn() {
     setActiveUrl(url);
   };
 
+  // Stencil position & 3D wrap simulation
   const stencilStyle = (): CSSProperties => {
     if (manual) {
       return {
         left: `${manualPos.x * 100}%`,
         top: `${manualPos.y * 100}%`,
-        width: `${28 * scaleMul}%`,
+        width: `${26 * scaleMul}%`,
         transform: `translate(-50%, -50%) rotate(${rotOffset}deg)`,
         opacity,
       };
@@ -285,73 +318,124 @@ export default function VirtualTryOn() {
     if (!arm.visible) {
       return {
         left: "50%",
-        top: "45%",
+        top: "50%",
         width: `${22 * scaleMul}%`,
         transform: `translate(-50%, -50%) rotate(${rotOffset}deg)`,
-        opacity: opacity * 0.35,
+        opacity: opacity * 0.25,
       };
     }
-    const w = Math.min(55, Math.max(12, arm.length * 140 * scaleMul));
+    
+    // Dynamic sizing pinned directly to forearm proportions
+    const dynamicWidth = Math.min(50, Math.max(15, arm.length * 105 * scaleMul));
+
     return {
       left: `${arm.cx * 100}%`,
       top: `${arm.cy * 100}%`,
-      width: `${w}%`,
+      width: `${dynamicWidth}%`,
       transform: `translate(-50%, -50%) rotate(${arm.angle + rotOffset}deg)`,
       opacity,
     };
   };
 
+  // Snapshot functionality: Blends current frame + stencil to Canvas
+  const captureSnapshot = () => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // 1. Draw camera frame (mirror if front camera)
+    ctx.save();
+    if (mirrorVideo) {
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+    }
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    ctx.restore();
+
+    // 2. Draw Tattoo Stencil with Multiply blend mode
+    if (activeUrl) {
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.src = activeUrl;
+      img.onload = () => {
+        ctx.save();
+        ctx.globalCompositeOperation = "multiply";
+        ctx.globalAlpha = opacity;
+
+        const posX = (manual ? manualPos.x : arm.visible ? arm.cx : 0.5) * canvas.width;
+        const posY = (manual ? manualPos.y : arm.visible ? arm.cy : 0.5) * canvas.height;
+        const currentAngle = (manual ? rotOffset : arm.angle + rotOffset) * (Math.PI / 180);
+        const wPercent = manual ? 0.26 * scaleMul : Math.min(0.5, arm.length * 1.05 * scaleMul);
+        const targetW = canvas.width * wPercent;
+        const aspect = img.height / img.width || 1;
+        const targetH = targetW * aspect;
+
+        ctx.translate(posX, posY);
+        ctx.rotate(currentAngle);
+        ctx.drawImage(img, -targetW / 2, -targetH / 2, targetW, targetH);
+        ctx.restore();
+
+        setSnapshotUrl(canvas.toDataURL("image/png"));
+      };
+    }
+  };
+
   return (
-    <section className="relative z-10 min-h-[100svh] bg-void pb-16 pt-20 text-parchment sm:pt-24">
-      <div className="mx-auto max-w-5xl px-3 sm:px-6">
+    <section className="relative z-10 min-h-[100svh] bg-black pb-16 pt-20 text-white sm:pt-24">
+      <div className="mx-auto max-w-5xl px-4 sm:px-6">
         <div className="mb-4 text-center md:mb-6">
-          <p className="mb-1 text-[10px] uppercase tracking-[0.35em] text-rose/80">
-            Live arm tracking
+          <p className="mb-1 text-[10px] uppercase tracking-[0.35em] text-white/50">
+            Augmented Reality Studio
           </p>
-          <h1 className="font-display text-2xl font-medium sm:text-3xl md:text-4xl">
-            Stencil locked to your arm.
+          <h1 className="text-2xl font-black uppercase tracking-tight sm:text-3xl md:text-4xl">
+            Live Forearm Stencil
           </h1>
-          <p className="mt-2 text-xs text-parchment/45 sm:text-sm">
+          <p className="mt-2 text-xs text-white/40">
             {status}
-            {arm.visible && !manual ? " · Arm detected" : ""}
+            {arm.visible && !manual ? " • Forearm Locked & Stabilized" : ""}
             {!arm.visible && tracking && !manual
-              ? " · Show forearm to camera"
+              ? " • Hold your forearm clearly in front of the lens"
               : ""}
           </p>
         </div>
 
-        {error && (
-          <p className="mb-3 text-center text-sm text-rose/90">{error}</p>
-        )}
+        {error && <p className="mb-3 text-center text-sm text-red-500">{error}</p>}
 
-        <div className="mb-3 flex justify-center gap-2">
+        {/* Camera Selector Switch */}
+        <div className="mb-4 flex justify-center gap-2">
           <button
             type="button"
             onClick={() => switchCamera("user")}
-            className={`min-h-[40px] rounded-full px-4 py-2 text-[10px] uppercase tracking-[0.2em] transition ${
+            className={`rounded-full px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${
               facing === "user"
-                ? "bg-parchment text-void"
-                : "border border-parchment/25 text-parchment/55"
+                ? "bg-white text-black"
+                : "border border-white/20 text-white/60 hover:border-white/40"
             }`}
           >
-            Front camera
+            Front Camera
           </button>
           <button
             type="button"
             onClick={() => switchCamera("environment")}
-            className={`min-h-[40px] rounded-full px-4 py-2 text-[10px] uppercase tracking-[0.2em] transition ${
+            className={`rounded-full px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${
               facing === "environment"
-                ? "bg-parchment text-void"
-                : "border border-parchment/25 text-parchment/55"
+                ? "bg-white text-black"
+                : "border border-white/20 text-white/60 hover:border-white/40"
             }`}
           >
-            Back camera
+            Back Camera
           </button>
         </div>
 
+        {/* AR Viewport Container */}
         <div
           ref={containerRef}
-          className="relative mx-auto aspect-[3/4] w-full max-w-2xl overflow-hidden rounded-sm border border-white/10 bg-charcoal sm:aspect-[4/5] md:aspect-video md:max-h-[65vh]"
+          className="relative mx-auto aspect-[3/4] w-full max-w-2xl overflow-hidden rounded-2xl border border-white/10 bg-neutral-950 sm:aspect-[4/5] md:aspect-video shadow-2xl"
         >
           <video
             ref={videoRef}
@@ -363,15 +447,11 @@ export default function VirtualTryOn() {
             }`}
           />
 
+          {/* Stencil Layer with Cylindrical Shading Wrapping Illusion */}
           {activeUrl && (
-            <img
-              src={activeUrl}
-              alt="Stencil"
-              draggable={false}
-              className={`absolute z-10 max-w-none touch-none select-none mix-blend-multiply ${
-                manual
-                  ? "cursor-grab active:cursor-grabbing"
-                  : "pointer-events-none"
+            <div
+              className={`absolute z-10 select-none touch-none ${
+                manual ? "cursor-grab active:cursor-grabbing" : "pointer-events-none"
               }`}
               style={stencilStyle()}
               onPointerDown={
@@ -399,73 +479,107 @@ export default function VirtualTryOn() {
                     }
                   : undefined
               }
-            />
+            >
+              <div className="relative w-full h-full">
+                {/* The Ink Image */}
+                <img
+                  src={activeUrl}
+                  alt="Stencil"
+                  draggable={false}
+                  className="w-full h-auto object-contain mix-blend-multiply filter contrast-125"
+                />
+                
+                {/* Cylindrical Edge Gradient (Shadows the sides so the ink appears wrapped around flesh) */}
+                <div 
+                  className="absolute inset-0 pointer-events-none mix-blend-multiply"
+                  style={{
+                    background: "linear-gradient(to right, rgba(0,0,0,0.38) 0%, transparent 25%, transparent 75%, rgba(0,0,0,0.38) 100%)"
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Capture Snapshot Action Button */}
+          {tracking && (
+            <button
+              type="button"
+              onClick={captureSnapshot}
+              className="absolute bottom-5 right-5 z-20 flex items-center gap-2 rounded-full bg-white px-5 py-2.5 text-xs font-bold uppercase tracking-widest text-black shadow-lg hover:scale-105 transition-all"
+            >
+              <Camera size={16} />
+              <span>Capture Stencil</span>
+            </button>
           )}
 
           {!tracking && (
-            <div className="absolute inset-0 flex items-center justify-center bg-charcoal/80">
+            <div className="absolute inset-0 flex items-center justify-center bg-black/80">
               <button
                 type="button"
                 onClick={() => startCamera(facing)}
-                className="rounded-full bg-parchment px-6 py-3 text-[11px] uppercase tracking-[0.25em] text-void"
+                className="rounded-full bg-white px-8 py-3.5 text-xs font-bold uppercase tracking-widest text-black hover:scale-105 transition"
               >
-                Enable camera
+                Enable Camera
               </button>
             </div>
           )}
         </div>
 
-        <div className="mx-auto mt-5 max-w-2xl">
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <p className="text-[10px] uppercase tracking-[0.3em] text-parchment/40">
-              Designs
+        {/* Flash Selection & Upload Bar */}
+        <div className="mx-auto mt-6 max-w-2xl">
+          <div className="mb-3 flex items-center justify-between">
+            <p className="text-[10px] uppercase tracking-[0.25em] text-white/50">
+              Select Flash or Upload Ink
             </p>
-            <label className="cursor-pointer rounded-full border border-parchment/25 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-parchment/70 transition hover:border-parchment/50">
-              Upload your design
+            <label className="cursor-pointer rounded-full border border-white/20 px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:border-white/60 transition">
+              Upload Design
               <input
                 type="file"
-                accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                accept="image/*"
                 className="hidden"
                 onChange={onDesignUpload}
               />
             </label>
           </div>
-          <div className="flex gap-2 overflow-x-auto pb-2">
+
+          <div className="flex gap-3 overflow-x-auto pb-2 no-scrollbar">
             {flashes.map((f) => (
               <button
                 key={f.id}
                 type="button"
                 onClick={() => setActiveUrl(f.url)}
-                className={`h-20 w-20 shrink-0 overflow-hidden rounded-sm border sm:h-24 sm:w-24 ${
+                className={`h-20 w-20 shrink-0 overflow-hidden rounded-xl border-2 transition-all ${
                   activeUrl === f.url
-                    ? "border-parchment/60"
-                    : "border-white/10 opacity-55"
+                    ? "border-white scale-95"
+                    : "border-white/10 opacity-60 hover:opacity-100"
                 }`}
               >
                 <img
                   src={f.url}
                   alt={f.label}
-                  className="h-full w-full object-cover img-cinematic grayscale"
+                  className="h-full w-full object-cover grayscale"
                 />
               </button>
             ))}
           </div>
         </div>
 
-        <div className="mx-auto mt-5 max-w-md space-y-4 rounded-sm border border-white/8 bg-charcoal/50 p-4">
-          <label className="flex items-center justify-between gap-3 text-[11px] text-parchment/60">
-            <span>Manual drag (override tracking)</span>
+        {/* Adjustments Panel */}
+        <div className="mx-auto mt-6 max-w-md space-y-4 rounded-2xl border border-white/10 bg-white/5 p-5 backdrop-blur-md">
+          <label className="flex items-center justify-between text-xs uppercase tracking-widest text-white/70">
+            <span>Manual Drag Override</span>
             <input
               type="checkbox"
               checked={manual}
               onChange={(e) => setManual(e.target.checked)}
-              className="h-4 w-4 accent-rose"
+              className="h-4 w-4 accent-white cursor-pointer"
             />
           </label>
+
           <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
-              <span>Size</span>
-              <span className="text-brass">{Math.round(scaleMul * 100)}%</span>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
+              <span>Size Multiplier</span>
+              <span>{Math.round(scaleMul * 100)}%</span>
             </div>
             <input
               type="range"
@@ -474,13 +588,14 @@ export default function VirtualTryOn() {
               step="0.05"
               value={scaleMul}
               onChange={(e) => setScaleMul(parseFloat(e.target.value))}
-              className="w-full accent-rose"
+              className="w-full accent-white"
             />
           </div>
+
           <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
-              <span>Rotation offset</span>
-              <span className="text-brass">{rotOffset}°</span>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
+              <span>Rotation Fine-Tune</span>
+              <span>{rotOffset}°</span>
             </div>
             <input
               type="range"
@@ -489,40 +604,65 @@ export default function VirtualTryOn() {
               step="1"
               value={rotOffset}
               onChange={(e) => setRotOffset(parseFloat(e.target.value))}
-              className="w-full accent-rose"
+              className="w-full accent-white"
             />
           </div>
+
           <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-parchment/45">
-              <span>Opacity</span>
-              <span className="text-brass">{Math.round(opacity * 100)}%</span>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
+              <span>Ink Density / Opacity</span>
+              <span>{Math.round(opacity * 100)}%</span>
             </div>
             <input
               type="range"
-              min="0.4"
+              min="0.3"
               max="1"
               step="0.05"
               value={opacity}
               onChange={(e) => setOpacity(parseFloat(e.target.value))}
-              className="w-full accent-rose"
+              className="w-full accent-white"
             />
           </div>
         </div>
-
-        <p className="mx-auto mt-6 max-w-lg text-center text-[11px] leading-relaxed text-parchment/35">
-          Front camera is mirrored (selfie). Back camera is natural for pointing
-          at your arm. Desktop webcams usually only have a front camera.
-        </p>
-
-        <div className="mt-6 flex justify-center">
-          <a
-            href="/#reserve"
-            className="inline-flex min-h-[48px] items-center rounded-full bg-parchment px-8 py-3 text-[11px] font-medium uppercase tracking-[0.25em] text-void"
-          >
-            Reserve a session
-          </a>
-        </div>
       </div>
+
+      {/* Snapshot Preview Modal */}
+      {snapshotUrl && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
+          <div className="relative max-w-2xl w-full bg-neutral-900 border border-white/10 rounded-2xl overflow-hidden p-6 text-center">
+            <button
+              onClick={() => setSnapshotUrl(null)}
+              className="absolute top-4 right-4 text-white/60 hover:text-white"
+            >
+              <X size={24} />
+            </button>
+            <h3 className="text-xl font-bold uppercase tracking-widest mb-4">
+              Your Tattoo Preview
+            </h3>
+            <img
+              src={snapshotUrl}
+              alt="Snapshot"
+              className="w-full rounded-xl mb-6 border border-white/10 shadow-2xl"
+            />
+            <div className="flex justify-center gap-4">
+              <a
+                href={snapshotUrl}
+                download="iron-rose-stencil-preview.png"
+                className="flex items-center gap-2 rounded-full bg-white px-6 py-3 text-xs font-bold uppercase tracking-widest text-black hover:scale-105 transition"
+              >
+                <Download size={16} />
+                <span>Save Photo</span>
+              </a>
+              <button
+                onClick={() => setSnapshotUrl(null)}
+                className="rounded-full border border-white/20 px-6 py-3 text-xs font-bold uppercase tracking-widest text-white hover:bg-white/10 transition"
+              >
+                Retake
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

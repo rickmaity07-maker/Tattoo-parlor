@@ -81,7 +81,6 @@ export default function VirtualTryOn() {
 
   const mirrorVideo = facing === "user";
 
-  // Pre-load the active image for instantaneous canvas drawing
   useEffect(() => {
     if (!activeUrl) return;
     const img = new Image();
@@ -100,7 +99,6 @@ export default function VirtualTryOn() {
     setTracking(false);
   }, []);
 
-  // Initialize Hand Landmarker
   useEffect(() => {
     let cancelled = false;
     async function init() {
@@ -175,7 +173,6 @@ export default function VirtualTryOn() {
     await startCamera(next);
   };
 
-  // The Live Canvas & AI Tracking Loop
   useEffect(() => {
     if (!tracking || !landmarkerRef.current) return;
 
@@ -197,7 +194,6 @@ export default function VirtualTryOn() {
         canvas.height = video.videoHeight;
       }
 
-      // 1. Process AI Tracking
       if (video.currentTime !== lastVideoTimeRef.current) {
         lastVideoTimeRef.current = video.currentTime;
         try {
@@ -217,11 +213,15 @@ export default function VirtualTryOn() {
             const cx = mirrorVideo ? 1 - rawCx : rawCx;
             const cy = rawCy;
 
-            // FIX: Subtract 90 degrees so pointing arm UP = 0 degree vertical alignment
             const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI - 90;
 
             const prev = smoothedArmRef.current;
-            const smoothFactor = prev.visible ? 0.4 : 1.0; // Tightened from 0.25 for faster response
+            
+            // SMART FILTERING: Velocity-based Lerp for extreme stickiness
+            const dist = Math.hypot(cx - prev.cx, cy - prev.cy);
+            let smoothFactor = dist > 0.04 ? 0.6 : 0.15; // Fast if moving, sticky if still
+            if (!prev.visible) smoothFactor = 1.0;
+
             const dAngle = diffAngle(rawAngle, prev.angle);
 
             const nextPose: ArmPose = {
@@ -243,7 +243,6 @@ export default function VirtualTryOn() {
         }
       }
 
-      // 2. Render Live Graphics to Canvas
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       
       ctx.save();
@@ -254,7 +253,7 @@ export default function VirtualTryOn() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       ctx.restore();
 
-      // Draw Tattoo
+      // SMART DRAWING ENGINE
       if (imgCacheRef.current) {
         const activePose = manual 
           ? { cx: manualPos.x, cy: manualPos.y, angle: 0, length: 0.15, visible: true } 
@@ -266,20 +265,37 @@ export default function VirtualTryOn() {
           ctx.globalAlpha = opacity;
           ctx.filter = "grayscale(100%) contrast(120%)";
 
+          // 1. Aspect Ratio Detection
+          const imgW = imgCacheRef.current.width;
+          const imgH = imgCacheRef.current.height;
+          const aspect = imgW / imgH;
+          const isBand = aspect > 1.25; // Distinctly wider than tall
+
+          // 2. Dynamic Rotation
+          let autoAngle = activePose.angle;
+          if (isBand) {
+             autoAngle += 90; // Snap armbands to wrap the arm horizontally
+          }
+
           const posX = activePose.cx * canvas.width;
           const posY = activePose.cy * canvas.height;
-          
-          // Slider offset logic
           const appliedOffset = mirrorVideo ? -rotOffset : rotOffset;
-          const currentAngle = (activePose.angle + appliedOffset) * (Math.PI / 180);
+          const currentAngle = (autoAngle + appliedOffset) * (Math.PI / 180);
           
-          const targetW = canvas.width * (activePose.length * 1.8 * scaleMul);
-          const aspect = imgCacheRef.current.height / imgCacheRef.current.width || 1;
-          const targetH = targetW * aspect;
+          // 3. Dynamic Scaling
+          let targetW, targetH;
+          if (isBand) {
+            // Armbands: Scale width to match forearm thickness
+            targetW = canvas.width * (activePose.length * 2.8 * scaleMul);
+            targetH = targetW / aspect;
+          } else {
+            // Vertical Sleeves: Scale height to match forearm length
+            targetH = canvas.width * (activePose.length * 3.5 * scaleMul);
+            targetW = targetH * aspect;
+          }
 
           ctx.translate(posX, posY);
           
-          // FIX: Mirror the tattoo along with the camera so text isn't backwards
           if (mirrorVideo) {
              ctx.scale(-1, 1);
           }
@@ -305,7 +321,6 @@ export default function VirtualTryOn() {
     setActiveUrl(url);
   };
 
-  // Capture Snapshot - Grabs exact 1:1 view of the canvas for downloading
   const captureSnapshot = () => {
     const canvas = canvasRef.current;
     if (canvas) {
@@ -341,15 +356,12 @@ export default function VirtualTryOn() {
           </button>
         </div>
 
-        {/* The Live Viewport */}
         <div
           ref={containerRef}
           className="relative mx-auto aspect-[3/4] w-full max-w-2xl overflow-hidden rounded-2xl border border-white/10 bg-neutral-950 sm:aspect-[4/5] md:aspect-video shadow-2xl"
         >
-          {/* Hidden Video Feed for AI Processing */}
           <video ref={videoRef} playsInline muted autoPlay className="hidden" />
 
-          {/* Visible Canvas (Handles 100% of graphics and blending natively) */}
           <canvas 
             ref={canvasRef} 
             className="absolute inset-0 h-full w-full object-cover"
@@ -395,7 +407,6 @@ export default function VirtualTryOn() {
           )}
         </div>
 
-        {/* Flash Selection */}
         <div className="mx-auto mt-6 max-w-2xl">
           <div className="mb-3 flex items-center justify-between">
             <p className="text-[10px] uppercase tracking-[0.25em] text-white/50">
@@ -415,7 +426,6 @@ export default function VirtualTryOn() {
           </div>
         </div>
 
-        {/* Sliders */}
         <div className="mx-auto mt-6 max-w-md space-y-4 rounded-2xl border border-white/10 bg-white/5 p-5 backdrop-blur-md">
           <label className="flex items-center justify-between text-xs uppercase tracking-widest text-white/70">
             <span>Manual Override (Drag anywhere)</span>
@@ -436,7 +446,6 @@ export default function VirtualTryOn() {
         </div>
       </div>
 
-      {/* The Result Modal - Pops up instantly when Capture Photo is clicked */}
       {snapshotUrl && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm">
           <div className="relative max-w-2xl w-full bg-neutral-900 border border-white/10 rounded-2xl overflow-hidden p-6 text-center">

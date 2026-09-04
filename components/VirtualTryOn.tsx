@@ -34,11 +34,11 @@ type ArmPose = {
   cx: number;
   cy: number;
   angle: number;
-  length: number; // Size reference based on hand size
+  length: number; 
   visible: boolean;
 };
 
-// SWITCHED TO HAND TRACKER: Far more accurate for close-up arm shots
+// Hand Tracker Engine
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 const WASM_ROOT =
@@ -81,7 +81,7 @@ export default function VirtualTryOn() {
 
   const mirrorVideo = facing === "user";
 
-  // Pre-load the active image so the canvas can draw it instantly
+  // Pre-load the active image for instantaneous canvas drawing
   useEffect(() => {
     if (!activeUrl) return;
     const img = new Image();
@@ -113,7 +113,7 @@ export default function VirtualTryOn() {
         let landmarker: any = await HandLandmarker.createFromOptions(fileset, {
           baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
           runningMode: "VIDEO",
-          numHands: 1, // Only track one hand to prevent jumping
+          numHands: 1, 
         });
 
         if (!cancelled) {
@@ -192,7 +192,6 @@ export default function VirtualTryOn() {
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
 
-      // Ensure canvas matches video size
       if (canvas.width !== video.videoWidth) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -205,27 +204,24 @@ export default function VirtualTryOn() {
           const result = landmarker.detectForVideo(video, performance.now());
           
           if (result.landmarks && result.landmarks.length > 0) {
-            // Landmark 0 is the Wrist. Landmark 9 is the middle finger knuckle.
             const hand = result.landmarks[0];
             const wrist = hand[0];
             const knuckle = hand[9];
 
-            // Calculate direction from knuckle to wrist (pointing down the arm)
             const dx = wrist.x - knuckle.x;
             const dy = wrist.y - knuckle.y;
             const length = Math.hypot(dx, dy);
 
-            // Project tattoo onto forearm (1.5x hand length down from wrist)
             const rawCx = wrist.x + dx * 1.5;
             const rawCy = wrist.y + dy * 1.5;
             const cx = mirrorVideo ? 1 - rawCx : rawCx;
             const cy = rawCy;
 
-            let rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
-            if (mirrorVideo) rawAngle = -rawAngle;
+            // FIX: Subtract 90 degrees so pointing arm UP = 0 degree vertical alignment
+            const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI - 90;
 
             const prev = smoothedArmRef.current;
-            const smoothFactor = prev.visible ? 0.25 : 1.0; // Smooths out jitter
+            const smoothFactor = prev.visible ? 0.4 : 1.0; // Tightened from 0.25 for faster response
             const dAngle = diffAngle(rawAngle, prev.angle);
 
             const nextPose: ArmPose = {
@@ -250,7 +246,6 @@ export default function VirtualTryOn() {
       // 2. Render Live Graphics to Canvas
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       
-      // Draw Webcam Feed
       ctx.save();
       if (mirrorVideo) {
         ctx.translate(canvas.width, 0);
@@ -259,7 +254,7 @@ export default function VirtualTryOn() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       ctx.restore();
 
-      // Draw Tattoo with Multiply Blend Mode (KILLS WHITE BACKGROUNDS)
+      // Draw Tattoo
       if (imgCacheRef.current) {
         const activePose = manual 
           ? { cx: manualPos.x, cy: manualPos.y, angle: 0, length: 0.15, visible: true } 
@@ -267,23 +262,28 @@ export default function VirtualTryOn() {
 
         if (activePose.visible) {
           ctx.save();
-          // THIS is the magic property that works 100% of the time in canvas
           ctx.globalCompositeOperation = "multiply"; 
           ctx.globalAlpha = opacity;
-          
-          // Grayscale the image so it looks like dark ink
           ctx.filter = "grayscale(100%) contrast(120%)";
 
           const posX = activePose.cx * canvas.width;
           const posY = activePose.cy * canvas.height;
-          const currentAngle = (activePose.angle + rotOffset) * (Math.PI / 180);
           
-          // Dynamic sizing
-          const targetW = canvas.width * (activePose.length * 1.5 * scaleMul);
+          // Slider offset logic
+          const appliedOffset = mirrorVideo ? -rotOffset : rotOffset;
+          const currentAngle = (activePose.angle + appliedOffset) * (Math.PI / 180);
+          
+          const targetW = canvas.width * (activePose.length * 1.8 * scaleMul);
           const aspect = imgCacheRef.current.height / imgCacheRef.current.width || 1;
           const targetH = targetW * aspect;
 
           ctx.translate(posX, posY);
+          
+          // FIX: Mirror the tattoo along with the camera so text isn't backwards
+          if (mirrorVideo) {
+             ctx.scale(-1, 1);
+          }
+          
           ctx.rotate(currentAngle);
           ctx.drawImage(imgCacheRef.current, -targetW / 2, -targetH / 2, targetW, targetH);
           ctx.restore();
@@ -305,7 +305,7 @@ export default function VirtualTryOn() {
     setActiveUrl(url);
   };
 
-  // Taking a snapshot is now trivial because the Canvas already holds the blended image
+  // Capture Snapshot - Grabs exact 1:1 view of the canvas for downloading
   const captureSnapshot = () => {
     const canvas = canvasRef.current;
     if (canvas) {
@@ -325,7 +325,7 @@ export default function VirtualTryOn() {
           </h1>
           <p className="mt-2 text-xs text-white/40">
             {status}
-            {arm.visible && !manual ? " • Forearm Locked" : ""}
+            {arm.visible && !manual ? " • Tracking Locked" : ""}
             {!arm.visible && tracking && !manual ? " • Show your hand to the camera" : ""}
           </p>
         </div>
@@ -436,7 +436,7 @@ export default function VirtualTryOn() {
         </div>
       </div>
 
-      {/* The Result Modal */}
+      {/* The Result Modal - Pops up instantly when Capture Photo is clicked */}
       {snapshotUrl && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4 backdrop-blur-sm">
           <div className="relative max-w-2xl w-full bg-neutral-900 border border-white/10 rounded-2xl overflow-hidden p-6 text-center">

@@ -38,7 +38,6 @@ type ArmPose = {
   visible: boolean;
 };
 
-// Hand Tracker Engine
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 const WASM_ROOT =
@@ -56,9 +55,10 @@ export default function VirtualTryOn() {
   const landmarkerRef = useRef<any>(null);
   const rafRef = useRef<number>(0);
   const lastVideoTimeRef = useRef(-1);
-  const memoryLockRef = useRef<number>(0); // NEW: Keeps track of dropped frames for Memory Lock
+  const memoryLockRef = useRef<number>(0); 
 
-  const imgCacheRef = useRef<HTMLImageElement | null>(null);
+  // Store processed Canvas instead of raw Image for the 3D wrap effect
+  const imgCacheRef = useRef<HTMLCanvasElement | null>(null);
   const smoothedArmRef = useRef<ArmPose>({
     cx: 0.5, cy: 0.5, angle: 0, length: 0.2, visible: false,
   });
@@ -70,10 +70,14 @@ export default function VirtualTryOn() {
   const [facing, setFacing] = useState<Facing>("user");
   const [flashes, setFlashes] = useState<Flash[]>(DEFAULT_FLASH);
   const [activeUrl, setActiveUrl] = useState<string | null>(DEFAULT_FLASH[0].url);
+  
+  // Controls
   const [scaleMul, setScaleMul] = useState(1);
   const [rotOffset, setRotOffset] = useState(0);
   const [opacity, setOpacity] = useState(0.85);
+  const [armOffset, setArmOffset] = useState(1.8); // Controls placement up/down the arm
   const [manual, setManual] = useState(false);
+  
   const [arm, setArm] = useState<ArmPose>({
     cx: 0.5, cy: 0.5, angle: 0, length: 0.2, visible: false,
   });
@@ -82,13 +86,34 @@ export default function VirtualTryOn() {
 
   const mirrorVideo = facing === "user";
 
+  // THE 3D WRAP ILLUSION PRE-PROCESSOR
   useEffect(() => {
     if (!activeUrl) return;
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.src = activeUrl;
     img.onload = () => {
-      imgCacheRef.current = img;
+      // Create an offscreen canvas to bake the cylindrical fade into the design
+      const offCanvas = document.createElement("canvas");
+      offCanvas.width = img.width;
+      offCanvas.height = img.height;
+      const octx = offCanvas.getContext("2d");
+      
+      if (octx) {
+        octx.drawImage(img, 0, 0);
+        
+        // Mask out the left and right edges to fake curvature
+        octx.globalCompositeOperation = "destination-in";
+        const grad = octx.createLinearGradient(0, 0, offCanvas.width, 0);
+        grad.addColorStop(0, "rgba(0,0,0,0)");     // Left edge invisible
+        grad.addColorStop(0.2, "rgba(0,0,0,1)");   // Solid front
+        grad.addColorStop(0.8, "rgba(0,0,0,1)");   // Solid front
+        grad.addColorStop(1, "rgba(0,0,0,0)");     // Right edge invisible
+        
+        octx.fillStyle = grad;
+        octx.fillRect(0, 0, offCanvas.width, offCanvas.height);
+      }
+      imgCacheRef.current = offCanvas; 
     };
   }, [activeUrl]);
 
@@ -104,7 +129,7 @@ export default function VirtualTryOn() {
     let cancelled = false;
     async function init() {
       try {
-        setStatus("Loading Hand Tracker...");
+        setStatus("Loading Tracker...");
         const vision = await import("@mediapipe/tasks-vision");
         const { FilesetResolver, HandLandmarker } = vision;
         const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
@@ -201,7 +226,7 @@ export default function VirtualTryOn() {
           const result = landmarker.detectForVideo(video, performance.now());
           
           if (result.landmarks && result.landmarks.length > 0) {
-            memoryLockRef.current = 0; // Reset Memory Lock because we see the hand
+            memoryLockRef.current = 0; 
             const hand = result.landmarks[0];
             const wrist = hand[0];
             const knuckle = hand[9];
@@ -210,9 +235,9 @@ export default function VirtualTryOn() {
             const dy = wrist.y - knuckle.y;
             const length = Math.hypot(dx, dy);
 
-            // Anchor point moved further down to center of forearm (2.0x hand length)
-            const rawCx = wrist.x + dx * 2.0;
-            const rawCy = wrist.y + dy * 2.0;
+            // Placement controlled by user slider (armOffset)
+            const rawCx = wrist.x + dx * armOffset;
+            const rawCy = wrist.y + dy * armOffset;
             const cx = mirrorVideo ? 1 - rawCx : rawCx;
             const cy = rawCy;
 
@@ -236,7 +261,6 @@ export default function VirtualTryOn() {
             smoothedArmRef.current = nextPose;
             if (!manual) setArm(nextPose);
           } else {
-            // NEW: MEMORY LOCK. If hand is lost (zoomed in), freeze it in place for 90 frames (~1.5 seconds)
             memoryLockRef.current += 1;
             if (memoryLockRef.current > 90) {
               smoothedArmRef.current.visible = false;
@@ -244,7 +268,7 @@ export default function VirtualTryOn() {
             }
           }
         } catch {
-          // Ignore dropped frames
+          // Ignore
         }
       }
 
@@ -258,7 +282,6 @@ export default function VirtualTryOn() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       ctx.restore();
 
-      // SMART DRAWING ENGINE
       if (imgCacheRef.current) {
         const activePose = manual 
           ? { cx: manualPos.x, cy: manualPos.y, angle: 0, length: 0.15, visible: true } 
@@ -270,31 +293,24 @@ export default function VirtualTryOn() {
           ctx.globalAlpha = opacity;
           ctx.filter = "grayscale(100%) contrast(120%)";
 
-          // 1. Aspect Ratio Detection
           const imgW = imgCacheRef.current.width;
           const imgH = imgCacheRef.current.height;
           const aspect = imgW / imgH;
           const isBand = aspect > 1.25; 
 
-          // 2. Dynamic Rotation
           let autoAngle = activePose.angle;
-          if (isBand) {
-             autoAngle += 90; 
-          }
+          if (isBand) autoAngle += 90; 
 
           const posX = activePose.cx * canvas.width;
           const posY = activePose.cy * canvas.height;
           const appliedOffset = mirrorVideo ? -rotOffset : rotOffset;
           const currentAngle = (autoAngle + appliedOffset) * (Math.PI / 180);
           
-          // 3. ANATOMICAL SCALING
           let targetW, targetH;
           if (isBand) {
-            // Bands scale their WIDTH to match forearm thickness (~1.6x hand length)
             targetW = canvas.width * (activePose.length * 1.6 * scaleMul);
             targetH = targetW / aspect;
           } else {
-            // Sleeves scale their HEIGHT to cover forearm length (~3.8x hand length)
             targetH = canvas.width * (activePose.length * 3.8 * scaleMul);
             targetW = targetH * aspect;
           }
@@ -316,7 +332,7 @@ export default function VirtualTryOn() {
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [tracking, manual, mirrorVideo, arm, manualPos, rotOffset, scaleMul, opacity]);
+  }, [tracking, manual, mirrorVideo, arm, manualPos, rotOffset, scaleMul, opacity, armOffset]);
 
   const onDesignUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -436,6 +452,15 @@ export default function VirtualTryOn() {
             <span>Manual Override (Drag anywhere)</span>
             <input type="checkbox" checked={manual} onChange={(e) => setManual(e.target.checked)} className="h-4 w-4 accent-white cursor-pointer" />
           </label>
+          
+          {/* NEW PLACEMENT SLIDER */}
+          <div>
+            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
+              <span>Placement (Wrist ↔ Elbow)</span>
+            </div>
+            <input type="range" min="0.8" max="3.5" step="0.1" value={armOffset} onChange={(e) => setArmOffset(parseFloat(e.target.value))} className="w-full accent-white" />
+          </div>
+
           <div>
             <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
               <span>Size Multiplier</span><span>{Math.round(scaleMul * 100)}%</span>
@@ -444,9 +469,9 @@ export default function VirtualTryOn() {
           </div>
           <div>
             <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
-              <span>Rotation Offset</span><span>{rotOffset}°</span>
+              <span>Rotation Fine-Tune</span><span>{rotOffset}°</span>
             </div>
-            <input type="range" min="-180" max="180" step="1" value={rotOffset} onChange={(e) => setRotOffset(parseFloat(e.target.value))} className="w-full accent-white" />
+            <input type="range" min="-90" max="90" step="1" value={rotOffset} onChange={(e) => setRotOffset(parseFloat(e.target.value))} className="w-full accent-white" />
           </div>
         </div>
       </div>

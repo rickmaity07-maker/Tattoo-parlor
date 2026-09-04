@@ -56,6 +56,7 @@ export default function VirtualTryOn() {
   const landmarkerRef = useRef<any>(null);
   const rafRef = useRef<number>(0);
   const lastVideoTimeRef = useRef(-1);
+  const memoryLockRef = useRef<number>(0); // NEW: Keeps track of dropped frames for Memory Lock
 
   const imgCacheRef = useRef<HTMLImageElement | null>(null);
   const smoothedArmRef = useRef<ArmPose>({
@@ -200,6 +201,7 @@ export default function VirtualTryOn() {
           const result = landmarker.detectForVideo(video, performance.now());
           
           if (result.landmarks && result.landmarks.length > 0) {
+            memoryLockRef.current = 0; // Reset Memory Lock because we see the hand
             const hand = result.landmarks[0];
             const wrist = hand[0];
             const knuckle = hand[9];
@@ -208,18 +210,17 @@ export default function VirtualTryOn() {
             const dy = wrist.y - knuckle.y;
             const length = Math.hypot(dx, dy);
 
-            const rawCx = wrist.x + dx * 1.5;
-            const rawCy = wrist.y + dy * 1.5;
+            // Anchor point moved further down to center of forearm (2.0x hand length)
+            const rawCx = wrist.x + dx * 2.0;
+            const rawCy = wrist.y + dy * 2.0;
             const cx = mirrorVideo ? 1 - rawCx : rawCx;
             const cy = rawCy;
 
             const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI - 90;
 
             const prev = smoothedArmRef.current;
-            
-            // SMART FILTERING: Velocity-based Lerp for extreme stickiness
             const dist = Math.hypot(cx - prev.cx, cy - prev.cy);
-            let smoothFactor = dist > 0.04 ? 0.6 : 0.15; // Fast if moving, sticky if still
+            let smoothFactor = dist > 0.04 ? 0.6 : 0.15; 
             if (!prev.visible) smoothFactor = 1.0;
 
             const dAngle = diffAngle(rawAngle, prev.angle);
@@ -235,8 +236,12 @@ export default function VirtualTryOn() {
             smoothedArmRef.current = nextPose;
             if (!manual) setArm(nextPose);
           } else {
-            smoothedArmRef.current.visible = false;
-            if (!manual) setArm((a) => ({ ...a, visible: false }));
+            // NEW: MEMORY LOCK. If hand is lost (zoomed in), freeze it in place for 90 frames (~1.5 seconds)
+            memoryLockRef.current += 1;
+            if (memoryLockRef.current > 90) {
+              smoothedArmRef.current.visible = false;
+              if (!manual) setArm((a) => ({ ...a, visible: false }));
+            }
           }
         } catch {
           // Ignore dropped frames
@@ -269,12 +274,12 @@ export default function VirtualTryOn() {
           const imgW = imgCacheRef.current.width;
           const imgH = imgCacheRef.current.height;
           const aspect = imgW / imgH;
-          const isBand = aspect > 1.25; // Distinctly wider than tall
+          const isBand = aspect > 1.25; 
 
           // 2. Dynamic Rotation
           let autoAngle = activePose.angle;
           if (isBand) {
-             autoAngle += 90; // Snap armbands to wrap the arm horizontally
+             autoAngle += 90; 
           }
 
           const posX = activePose.cx * canvas.width;
@@ -282,15 +287,15 @@ export default function VirtualTryOn() {
           const appliedOffset = mirrorVideo ? -rotOffset : rotOffset;
           const currentAngle = (autoAngle + appliedOffset) * (Math.PI / 180);
           
-          // 3. Dynamic Scaling
+          // 3. ANATOMICAL SCALING
           let targetW, targetH;
           if (isBand) {
-            // Armbands: Scale width to match forearm thickness
-            targetW = canvas.width * (activePose.length * 2.8 * scaleMul);
+            // Bands scale their WIDTH to match forearm thickness (~1.6x hand length)
+            targetW = canvas.width * (activePose.length * 1.6 * scaleMul);
             targetH = targetW / aspect;
           } else {
-            // Vertical Sleeves: Scale height to match forearm length
-            targetH = canvas.width * (activePose.length * 3.5 * scaleMul);
+            // Sleeves scale their HEIGHT to cover forearm length (~3.8x hand length)
+            targetH = canvas.width * (activePose.length * 3.8 * scaleMul);
             targetW = targetH * aspect;
           }
 

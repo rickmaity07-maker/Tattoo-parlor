@@ -814,6 +814,42 @@ export default function VirtualTryOn() {
     }
   };
 
+  // There's no web API that writes straight into the OS Photos/Gallery app —
+  // that's a native-app-only permission on both iOS and Android. The closest
+  // a website can get is the Web Share API's native share sheet, which on
+  // both platforms includes a "Save Image"/"Save to Photos" action right in
+  // it — effectively a one-tap gallery save once the visitor picks it. Where
+  // that's not available (most desktop browsers, or an older mobile one),
+  // fall back to a plain download, which lands in Downloads/Files instead.
+  const saveSnapshot = async () => {
+    if (!snapshotUrl) return;
+
+    try {
+      const blob = await (await fetch(snapshotUrl)).blob();
+      const file = new File([blob], "iron-rose-preview.png", { type: "image/png" });
+
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({
+          files: [file],
+          title: "Iron Rose Tattoo Preview",
+        });
+        return;
+      }
+    } catch (err) {
+      // The user backing out of the share sheet throws AbortError — that's
+      // a deliberate cancel, not a failure, so don't fall through to a
+      // second save prompt on top of it.
+      if (err instanceof DOMException && err.name === "AbortError") return;
+    }
+
+    const a = document.createElement("a");
+    a.href = snapshotUrl;
+    a.download = "iron-rose-preview.png";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
+
   // Still checking the device on first client render — avoid flashing the
   // full camera UI before we know whether to show the desktop notice.
   if (isMobile === null) {
@@ -1032,9 +1068,9 @@ export default function VirtualTryOn() {
             <img src={snapshotUrl} alt="Snapshot" className="w-full rounded-xl mb-6 shadow-2xl" />
             <p className="mb-4 text-xs text-white/50">Not quite right? Close this and keep adjusting — your placement is still there.</p>
             <div className="flex justify-center gap-4">
-              <a href={snapshotUrl} download="iron-rose-preview.png" className="flex items-center gap-2 rounded-full bg-white px-6 py-3 text-xs font-bold uppercase tracking-widest text-black hover:scale-105 transition">
+              <button onClick={saveSnapshot} className="flex items-center gap-2 rounded-full bg-white px-6 py-3 text-xs font-bold uppercase tracking-widest text-black hover:scale-105 transition">
                 <Download size={16} /><span>Save Photo</span>
-              </a>
+              </button>
               <button
                 onClick={() => {
                   setSnapshotUrl(null);

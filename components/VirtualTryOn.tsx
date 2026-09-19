@@ -13,21 +13,25 @@ type Flash = { id: string; label: string; url: string };
 type Facing = "user" | "environment";
 type Region = "arm" | "face";
 
+// These need to be actual flash-sheet artwork on a flat card — a photo of
+// an existing tattoo inked on someone's skin has no clean background to key
+// out (it's all skin, hair, clothing), so it can never read as a stencil
+// once overlaid. Picked for a genuinely flat, consistent backdrop.
 const DEFAULT_FLASH: Flash[] = [
   {
     id: "1",
-    label: "Blackwork",
-    url: "https://images.unsplash.com/photo-1594812332797-bec39ee15b47?auto=format&fit=crop&w=500&q=80",
+    label: "Fine Line",
+    url: "https://images.unsplash.com/photo-1712686421453-444a1e1ebe5d?auto=format&fit=crop&w=500&q=80",
   },
   {
     id: "2",
-    label: "Fine line",
-    url: "https://images.unsplash.com/photo-1598371839696-5c5bb00bdc28?auto=format&fit=crop&w=500&q=80",
+    label: "Art Nouveau",
+    url: "https://images.unsplash.com/photo-1722715917774-3982544ff6fc?auto=format&fit=crop&w=500&q=80",
   },
   {
     id: "3",
-    label: "Ornamental",
-    url: "https://images.unsplash.com/photo-1562962230-16e4623d36e6?auto=format&fit=crop&w=500&q=80",
+    label: "Botanical",
+    url: "https://images.unsplash.com/photo-1722715917840-e5bcbee4a3b4?auto=format&fit=crop&w=500&q=80",
   },
 ];
 
@@ -50,6 +54,78 @@ function diffAngle(target: number, current: number) {
   return ((((target - current) % 360) + 540) % 360) - 180;
 }
 
+// Turns a flash-art photo (ink on a white/off-white/studio-card backdrop)
+// into a clean transparent stencil. Earlier this relied on the "multiply"
+// blend mode alone to hide a white background, which only works if the
+// backdrop is pure white — any off-white, cream, or textured card leaves a
+// visible rectangle. Instead we sample the image's own border to learn what
+// its actual background color is, then key out anything close to it,
+// leaving only the ink opaque (with a soft ramp so edges anti-alias instead
+// of looking cut with scissors).
+function extractInkStencil(img: HTMLImageElement): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = img.naturalWidth || img.width;
+  canvas.height = img.naturalHeight || img.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return canvas;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+  try {
+    const { width, height } = canvas;
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const px = imageData.data;
+
+    const borderR: number[] = [], borderG: number[] = [], borderB: number[] = [];
+    const sample = (x: number, y: number) => {
+      const i = (y * width + x) * 4;
+      borderR.push(px[i]);
+      borderG.push(px[i + 1]);
+      borderB.push(px[i + 2]);
+    };
+    const step = Math.max(1, Math.floor(Math.min(width, height) / 80));
+    for (let x = 0; x < width; x += step) {
+      sample(x, 0);
+      sample(x, height - 1);
+    }
+    for (let y = 0; y < height; y += step) {
+      sample(0, y);
+      sample(width - 1, y);
+    }
+    const n = borderR.length;
+    const bgR = borderR.reduce((a, b) => a + b, 0) / n;
+    const bgG = borderG.reduce((a, b) => a + b, 0) / n;
+    const bgB = borderB.reduce((a, b) => a + b, 0) / n;
+
+    // If the border itself isn't a fairly consistent color, there's no flat
+    // backdrop to key against — likely a candid photo (skin, hair, a room)
+    // rather than flash art on a card. Keying against a border average that
+    // doesn't mean anything would carve the image up arbitrarily, so leave
+    // it untouched instead of making it worse.
+    let variance = 0;
+    for (let i = 0; i < n; i++) {
+      variance += (borderR[i] - bgR) ** 2 + (borderG[i] - bgG) ** 2 + (borderB[i] - bgB) ** 2;
+    }
+    const borderSpread = Math.sqrt(variance / n);
+    if (borderSpread > 45) {
+      return canvas;
+    }
+
+    for (let i = 0; i < px.length; i += 4) {
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      const dist = Math.sqrt((r - bgR) ** 2 + (g - bgG) ** 2 + (b - bgB) ** 2);
+      const alpha = Math.max(0, Math.min(255, (dist - 16) * 6));
+      px[i + 3] = Math.min(px[i + 3], Math.round(alpha));
+    }
+    ctx.putImageData(imageData, 0, 0);
+  } catch {
+    // A cross-origin source without CORS headers taints the canvas and
+    // blocks pixel access — fall back to the un-keyed image rather than
+    // throwing; the multiply blend still hides a plain white backdrop.
+  }
+
+  return canvas;
+}
+
 // Approximates the design wrapping around a cylindrical surface (a forearm,
 // a cheek) instead of sitting flat: the source image is sliced into thin
 // vertical strips, each foreshortened and shaded as if it were a small facet
@@ -63,7 +139,7 @@ function drawWrappedDesign(
   wrapDeg: number,
   baseAlpha: number
 ) {
-  const strips = 32;
+  const strips = 48;
   const wrapRad = Math.max(0.01, (wrapDeg * Math.PI) / 180);
   const sinMax = Math.sin(wrapRad);
 
@@ -84,7 +160,9 @@ function drawWrappedDesign(
     const dx1 = (Math.sin(u1 * wrapRad) / sinMax) * (width / 2);
     const dw = Math.max(0.5, dx1 - dx0);
 
-    const shade = 0.4 + 0.6 * cosMid;
+    // Steeper falloff (vs. a flatter 0.4-1.0 range) so the curve away from
+    // camera reads as a real edge instead of a faint tint.
+    const shade = 0.18 + 0.82 * Math.pow(cosMid, 1.3);
 
     ctx.globalAlpha = baseAlpha * shade;
     ctx.drawImage(src, sx0, 0, sw, src.height, dx0, -height / 2, dw, height);
@@ -95,13 +173,27 @@ function drawWrappedDesign(
   const prevFilter = ctx.filter;
   const sheen = ctx.createLinearGradient(-width / 2, 0, width / 2, 0);
   sheen.addColorStop(0, "rgba(255,255,255,0)");
-  sheen.addColorStop(0.5, `rgba(255,255,255,${0.16 * baseAlpha})`);
+  sheen.addColorStop(0.5, `rgba(255,255,255,${0.22 * baseAlpha})`);
   sheen.addColorStop(1, "rgba(255,255,255,0)");
   ctx.globalCompositeOperation = "overlay";
   ctx.filter = "none";
   ctx.globalAlpha = 1;
   ctx.fillStyle = sheen;
   ctx.fillRect(-width / 2, -height / 2, width, height);
+
+  // Dark contact shadow along the true outer edges of the wrap — the last
+  // sliver of ink right before it curves out of sight should read as
+  // receding, not just dimmer.
+  const rim = ctx.createLinearGradient(-width / 2, 0, width / 2, 0);
+  rim.addColorStop(0, "rgba(0,0,0,0.55)");
+  rim.addColorStop(0.12, "rgba(0,0,0,0)");
+  rim.addColorStop(0.88, "rgba(0,0,0,0)");
+  rim.addColorStop(1, "rgba(0,0,0,0.55)");
+  ctx.globalCompositeOperation = "multiply";
+  ctx.globalAlpha = baseAlpha;
+  ctx.fillStyle = rim;
+  ctx.fillRect(-width / 2, -height / 2, width, height);
+
   ctx.globalCompositeOperation = prevOp;
   ctx.filter = prevFilter;
 }
@@ -166,30 +258,22 @@ export default function VirtualTryOn() {
     setIsMobile(uaMobile || (coarsePointer && narrowScreen));
   }, []);
 
-  // Edge-Fade 3D Processor
+  // Background-removal pipeline: key the flash-art photo down to just its
+  // ink (see extractInkStencil). The per-frame cylindrical wrap render
+  // handles edge fade/shading dynamically now, so this step is purely about
+  // getting a clean cutout, not baking in a directional fade.
   useEffect(() => {
     if (!activeUrl) return;
+    let cancelled = false;
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.src = activeUrl;
     img.onload = () => {
-      const offCanvas = document.createElement("canvas");
-      offCanvas.width = img.width;
-      offCanvas.height = img.height;
-      const octx = offCanvas.getContext("2d");
-      
-      if (octx) {
-        octx.drawImage(img, 0, 0);
-        octx.globalCompositeOperation = "destination-in";
-        const grad = octx.createLinearGradient(0, 0, offCanvas.width, 0);
-        grad.addColorStop(0, "rgba(0,0,0,0)");     
-        grad.addColorStop(0.2, "rgba(0,0,0,1)");   
-        grad.addColorStop(0.8, "rgba(0,0,0,1)");   
-        grad.addColorStop(1, "rgba(0,0,0,0)");     
-        octx.fillStyle = grad;
-        octx.fillRect(0, 0, offCanvas.width, offCanvas.height);
-      }
-      imgCacheRef.current = offCanvas; 
+      if (cancelled) return;
+      imgCacheRef.current = extractInkStencil(img);
+    };
+    return () => {
+      cancelled = true;
     };
   }, [activeUrl]);
 
@@ -390,7 +474,7 @@ export default function VirtualTryOn() {
       // Band designs wrap most of the way around a limb's circumference;
       // a portrait-style piece still sits on a rounded surface, so it
       // gets a gentler curve; a face gets the cheek's curvature.
-      const wrapDeg = region === "face" ? 42 : isBand ? 78 : 26;
+      const wrapDeg = region === "face" ? 48 : isBand ? 84 : 40;
       drawWrappedDesign(ctx, imgCacheRef.current, targetW, targetH, wrapDeg, opacity);
       ctx.restore();
     };
@@ -794,9 +878,9 @@ export default function VirtualTryOn() {
           </div>
           <div>
             <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
-              <span>Rotation Fine-Tune</span><span>{rotOffset}°</span>
+              <span>Rotation</span><span>{rotOffset}°</span>
             </div>
-            <input type="range" min="-90" max="90" step="1" value={rotOffset} onChange={(e) => setRotOffset(parseFloat(e.target.value))} className="w-full accent-white" />
+            <input type="range" min="-180" max="180" step="1" value={rotOffset} onChange={(e) => setRotOffset(parseFloat(e.target.value))} className="w-full accent-white" />
           </div>
         </div>
       </div>

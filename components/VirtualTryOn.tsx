@@ -118,7 +118,8 @@ export default function VirtualTryOn() {
   const camRequestIdRef = useRef(0);
 
   const imgCacheRef = useRef<HTMLCanvasElement | null>(null);
-  
+  const frozenFrameRef = useRef<HTMLCanvasElement | null>(null);
+
   // App State
   const [isMobile, setIsMobile] = useState<boolean | null>(null);
   const [region, setRegion] = useState<Region>("arm");
@@ -146,6 +147,11 @@ export default function VirtualTryOn() {
   
   const [manualPos, setManualPos] = useState({ x: 0.5, y: 0.5 });
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
+
+  // Post-capture editing: a still frame is frozen as the background while
+  // the design stays fully draggable/resizable/rotatable on top of it, so
+  // placement can be fine-tuned after the shot instead of only before it.
+  const [editing, setEditing] = useState(false);
 
   const mirrorVideo = facing === "user";
 
@@ -330,10 +336,92 @@ export default function VirtualTryOn() {
   useEffect(() => {
     if (!tracking) return;
 
+    // Shared between the live-video path and the frozen-frame editing path:
+    // positions/rotates/scales the cached design and hands it to the
+    // cylindrical-wrap renderer. Reads manual/manualPos/pose etc. from the
+    // enclosing closure, which is why this effect re-runs on every control change.
+    const drawDesignOverlay = (ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) => {
+      if (!imgCacheRef.current) return;
+      const activePose = manual
+        ? { cx: manualPos.x, cy: manualPos.y, angle: 0, length: 0.15, visible: true }
+        : pose;
+
+      if (!activePose.visible) return;
+
+      ctx.save();
+      ctx.globalCompositeOperation = "multiply";
+      ctx.globalAlpha = opacity;
+      ctx.filter = "grayscale(100%) contrast(120%)";
+
+      const imgW = imgCacheRef.current.width;
+      const imgH = imgCacheRef.current.height;
+      const aspect = imgW / imgH;
+      const isBand = aspect > 1.25;
+
+      let autoAngle = activePose.angle;
+      if (isBand && region === "arm") autoAngle += 90;
+
+      const posX = activePose.cx * canvas.width;
+      const posY = activePose.cy * canvas.height;
+      const appliedOffset = mirrorVideo ? -rotOffset : rotOffset;
+      const currentAngle = (autoAngle + appliedOffset) * (Math.PI / 180);
+
+      let targetW, targetH;
+      if (region === "arm") {
+        if (isBand) {
+          targetW = canvas.width * (activePose.length * 1.6 * scaleMul);
+          targetH = targetW / aspect;
+        } else {
+          targetH = canvas.width * (activePose.length * 3.8 * scaleMul);
+          targetW = targetH * aspect;
+        }
+      } else {
+        // FACE MATH
+        targetW = canvas.width * (activePose.length * 0.8 * scaleMul);
+        targetH = targetW / aspect;
+      }
+
+      ctx.translate(posX, posY);
+
+      if (mirrorVideo) ctx.scale(-1, 1);
+
+      ctx.rotate(currentAngle);
+
+      // Band designs wrap most of the way around a limb's circumference;
+      // a portrait-style piece still sits on a rounded surface, so it
+      // gets a gentler curve; a face gets the cheek's curvature.
+      const wrapDeg = region === "face" ? 42 : isBand ? 78 : 26;
+      drawWrappedDesign(ctx, imgCacheRef.current, targetW, targetH, wrapDeg, opacity);
+      ctx.restore();
+    };
+
     const tick = () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const landmarker = landmarkerRef.current;
+
+      // EDITING MODE: the background is a frozen still, not the live feed.
+      // Tracking is paused (there's no new video to detect against) but the
+      // design overlay below still redraws every frame so drag/slider
+      // adjustments (manual is forced on while editing) stay fully live.
+      if (editing) {
+        const frame = frozenFrameRef.current;
+        if (!canvas || !frame) {
+          rafRef.current = requestAnimationFrame(tick);
+          return;
+        }
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        if (canvas.width !== frame.width) {
+          canvas.width = frame.width;
+          canvas.height = frame.height;
+        }
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+        drawDesignOverlay(ctx, canvas);
+        rafRef.current = requestAnimationFrame(tick);
+        return;
+      }
 
       if (!video || !canvas || video.readyState < 2) {
         rafRef.current = requestAnimationFrame(tick);
@@ -442,66 +530,14 @@ export default function VirtualTryOn() {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
       ctx.restore();
 
-      if (imgCacheRef.current) {
-        const activePose = manual 
-          ? { cx: manualPos.x, cy: manualPos.y, angle: 0, length: 0.15, visible: true } 
-          : pose;
-
-        if (activePose.visible) {
-          ctx.save();
-          ctx.globalCompositeOperation = "multiply"; 
-          ctx.globalAlpha = opacity;
-          ctx.filter = "grayscale(100%) contrast(120%)";
-
-          const imgW = imgCacheRef.current.width;
-          const imgH = imgCacheRef.current.height;
-          const aspect = imgW / imgH;
-          const isBand = aspect > 1.25; 
-
-          let autoAngle = activePose.angle;
-          if (isBand && region === "arm") autoAngle += 90; 
-
-          const posX = activePose.cx * canvas.width;
-          const posY = activePose.cy * canvas.height;
-          const appliedOffset = mirrorVideo ? -rotOffset : rotOffset;
-          const currentAngle = (autoAngle + appliedOffset) * (Math.PI / 180);
-          
-          let targetW, targetH;
-          if (region === "arm") {
-            if (isBand) {
-              targetW = canvas.width * (activePose.length * 1.6 * scaleMul);
-              targetH = targetW / aspect;
-            } else {
-              targetH = canvas.width * (activePose.length * 3.8 * scaleMul);
-              targetW = targetH * aspect;
-            }
-          } else {
-             // FACE MATH
-             targetW = canvas.width * (activePose.length * 0.8 * scaleMul);
-             targetH = targetW / aspect;
-          }
-
-          ctx.translate(posX, posY);
-
-          if (mirrorVideo) ctx.scale(-1, 1);
-
-          ctx.rotate(currentAngle);
-
-          // Band designs wrap most of the way around a limb's circumference;
-          // a portrait-style piece still sits on a rounded surface, so it
-          // gets a gentler curve; a face gets the cheek's curvature.
-          const wrapDeg = region === "face" ? 42 : isBand ? 78 : 26;
-          drawWrappedDesign(ctx, imgCacheRef.current, targetW, targetH, wrapDeg, opacity);
-          ctx.restore();
-        }
-      }
+      drawDesignOverlay(ctx, canvas);
 
       rafRef.current = requestAnimationFrame(tick);
     };
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [tracking, ready, manual, mirrorVideo, pose, manualPos, rotOffset, scaleMul, opacity, placementOffset, region]);
+  }, [tracking, ready, editing, manual, mirrorVideo, pose, manualPos, rotOffset, scaleMul, opacity, placementOffset, region]);
 
   const onDesignUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -511,7 +547,42 @@ export default function VirtualTryOn() {
     setActiveUrl(url);
   };
 
-  const captureSnapshot = () => {
+  // Freezes the current camera frame and drops into editing mode: the design
+  // stays fully draggable, and the sliders below keep working, so placement
+  // can be fine-tuned on the still photo instead of only on live video.
+  const enterEditing = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas) return;
+
+    const frame = document.createElement("canvas");
+    frame.width = canvas.width;
+    frame.height = canvas.height;
+    const fctx = frame.getContext("2d");
+    if (fctx) {
+      fctx.save();
+      if (mirrorVideo) {
+        fctx.translate(frame.width, 0);
+        fctx.scale(-1, 1);
+      }
+      fctx.drawImage(video, 0, 0, frame.width, frame.height);
+      fctx.restore();
+    }
+    frozenFrameRef.current = frame;
+
+    // Hand off whatever position was live-tracking to manual placement so
+    // the design doesn't jump when tracking pauses.
+    if (!manual) setManualPos({ x: pose.cx, y: pose.cy });
+    setManual(true);
+    setEditing(true);
+  };
+
+  const discardEditing = () => {
+    frozenFrameRef.current = null;
+    setEditing(false);
+  };
+
+  const finalizeCapture = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     try {
@@ -564,41 +635,47 @@ export default function VirtualTryOn() {
             Live Stencil Preview
           </h1>
           <p className="mt-2 text-xs text-white/40">
-            {status}
-            {pose.visible && !manual ? " • Tracking Locked" : ""}
-            {!pose.visible && tracking && !manual ? ` • Show your ${region} to the camera` : ""}
+            {editing
+              ? "Editing capture — drag to reposition, use Size/Rotation below, then Save"
+              : status}
+            {!editing && pose.visible && !manual ? " • Tracking Locked" : ""}
+            {!editing && !pose.visible && tracking && !manual ? ` • Show your ${region} to the camera` : ""}
           </p>
         </div>
 
         {/* REGION TABS */}
-        <div className="mb-6 flex justify-center gap-2">
-          <div className="flex bg-white/5 rounded-full p-1 border border-white/10">
-            <button 
-              onClick={() => { setRegion("arm"); setPlacementOffset(1.8); }}
-              className={`rounded-full px-6 py-2 text-xs font-bold uppercase tracking-widest transition-all ${region === "arm" ? "bg-white text-black shadow-lg" : "text-white/60 hover:text-white"}`}
-            >
-              Arm
-            </button>
-            <button 
-              onClick={() => { setRegion("face"); setPlacementOffset(1.8); }}
-              className={`rounded-full px-6 py-2 text-xs font-bold uppercase tracking-widest transition-all ${region === "face" ? "bg-white text-black shadow-lg" : "text-white/60 hover:text-white"}`}
-            >
-              Face / Neck
-            </button>
+        {!editing && (
+          <div className="mb-6 flex justify-center gap-2">
+            <div className="flex bg-white/5 rounded-full p-1 border border-white/10">
+              <button
+                onClick={() => { setRegion("arm"); setPlacementOffset(1.8); }}
+                className={`rounded-full px-6 py-2 text-xs font-bold uppercase tracking-widest transition-all ${region === "arm" ? "bg-white text-black shadow-lg" : "text-white/60 hover:text-white"}`}
+              >
+                Arm
+              </button>
+              <button
+                onClick={() => { setRegion("face"); setPlacementOffset(1.8); }}
+                className={`rounded-full px-6 py-2 text-xs font-bold uppercase tracking-widest transition-all ${region === "face" ? "bg-white text-black shadow-lg" : "text-white/60 hover:text-white"}`}
+              >
+                Face / Neck
+              </button>
+            </div>
           </div>
-        </div>
+        )}
 
         {error && <p className="mb-3 text-center text-sm text-red-500">{error}</p>}
 
         {/* CAMERA CONTROLS */}
-        <div className="mb-4 flex justify-center gap-2">
-          <button onClick={() => switchCamera("user")} className={`rounded-full px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${facing === "user" ? "bg-white text-black" : "border border-white/20 text-white/60"}`}>
-            Front Camera
-          </button>
-          <button onClick={() => switchCamera("environment")} className={`rounded-full px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${facing === "environment" ? "bg-white text-black" : "border border-white/20 text-white/60"}`}>
-            Back Camera
-          </button>
-        </div>
+        {!editing && (
+          <div className="mb-4 flex justify-center gap-2">
+            <button onClick={() => switchCamera("user")} className={`rounded-full px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${facing === "user" ? "bg-white text-black" : "border border-white/20 text-white/60"}`}>
+              Front Camera
+            </button>
+            <button onClick={() => switchCamera("environment")} className={`rounded-full px-5 py-2 text-[10px] font-bold uppercase tracking-[0.2em] transition ${facing === "environment" ? "bg-white text-black" : "border border-white/20 text-white/60"}`}>
+              Back Camera
+            </button>
+          </div>
+        )}
 
         {/* VIEWPORT */}
         <div
@@ -633,13 +710,24 @@ export default function VirtualTryOn() {
             }
           />
 
-          {tracking && (
-            <button onClick={captureSnapshot} className="absolute bottom-5 right-5 z-20 flex items-center gap-2 rounded-full bg-white px-5 py-2.5 text-xs font-bold uppercase tracking-widest text-black shadow-lg hover:scale-105 transition-all">
+          {tracking && !editing && (
+            <button onClick={enterEditing} className="absolute bottom-5 right-5 z-20 flex items-center gap-2 rounded-full bg-white px-5 py-2.5 text-xs font-bold uppercase tracking-widest text-black shadow-lg hover:scale-105 transition-all">
               <Camera size={16} /><span>Capture</span>
             </button>
           )}
 
-          {!tracking && (
+          {editing && (
+            <div className="absolute bottom-5 left-1/2 z-20 flex -translate-x-1/2 items-center gap-3">
+              <button onClick={discardEditing} className="rounded-full border border-white/30 bg-black/60 px-5 py-2.5 text-xs font-bold uppercase tracking-widest text-white backdrop-blur transition hover:bg-black/80">
+                Retake
+              </button>
+              <button onClick={finalizeCapture} className="flex items-center gap-2 rounded-full bg-white px-5 py-2.5 text-xs font-bold uppercase tracking-widest text-black shadow-lg transition-all hover:scale-105">
+                <Download size={16} /><span>Save Photo</span>
+              </button>
+            </div>
+          )}
+
+          {!tracking && !editing && (
             <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-30">
               <button onClick={() => startCamera(facing)} className="rounded-full bg-white px-8 py-3.5 text-xs font-bold uppercase tracking-widest text-black hover:scale-105 transition">
                 Enable Camera
@@ -671,24 +759,32 @@ export default function VirtualTryOn() {
         {/* SLIDERS */}
         <div className="mx-auto mt-6 max-w-md space-y-4 rounded-2xl border border-white/10 bg-white/5 p-5 backdrop-blur-md">
           <label className="flex items-center justify-between text-xs uppercase tracking-widest text-white/70">
-            <span>Manual Override (Drag anywhere)</span>
-            <input type="checkbox" checked={manual} onChange={(e) => setManual(e.target.checked)} className="h-4 w-4 accent-white cursor-pointer" />
-          </label>
-          
-          <div>
-            <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
-              <span>{region === "arm" ? "Placement (Wrist ↔ Elbow)" : "Placement (Forehead ↔ Neck)"}</span>
-            </div>
-            <input 
-              type="range" 
-              min={region === "arm" ? 0.8 : 0.5} 
-              max={region === "arm" ? 3.5 : 3.5} 
-              step="0.1" 
-              value={placementOffset} 
-              onChange={(e) => setPlacementOffset(parseFloat(e.target.value))} 
-              className="w-full accent-white" 
+            <span>{editing ? "Manual Placement (editing capture)" : "Manual Override (Drag anywhere)"}</span>
+            <input
+              type="checkbox"
+              checked={manual}
+              disabled={editing}
+              onChange={(e) => setManual(e.target.checked)}
+              className="h-4 w-4 accent-white cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
             />
-          </div>
+          </label>
+
+          {!editing && (
+            <div>
+              <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
+                <span>{region === "arm" ? "Placement (Wrist ↔ Elbow)" : "Placement (Forehead ↔ Neck)"}</span>
+              </div>
+              <input
+                type="range"
+                min={region === "arm" ? 0.8 : 0.5}
+                max={region === "arm" ? 3.5 : 3.5}
+                step="0.1"
+                value={placementOffset}
+                onChange={(e) => setPlacementOffset(parseFloat(e.target.value))}
+                className="w-full accent-white"
+              />
+            </div>
+          )}
 
           <div>
             <div className="mb-1 flex justify-between text-[10px] uppercase tracking-widest text-white/50">
@@ -712,11 +808,20 @@ export default function VirtualTryOn() {
             <button onClick={() => setSnapshotUrl(null)} className="absolute top-4 right-4 text-white/60 hover:text-white"><X size={24} /></button>
             <h3 className="text-xl font-bold uppercase tracking-widest mb-4">Your Tattoo Preview</h3>
             <img src={snapshotUrl} alt="Snapshot" className="w-full rounded-xl mb-6 shadow-2xl" />
+            <p className="mb-4 text-xs text-white/50">Not quite right? Close this and keep adjusting — your placement is still there.</p>
             <div className="flex justify-center gap-4">
               <a href={snapshotUrl} download="iron-rose-preview.png" className="flex items-center gap-2 rounded-full bg-white px-6 py-3 text-xs font-bold uppercase tracking-widest text-black hover:scale-105 transition">
                 <Download size={16} /><span>Save Photo</span>
               </a>
-              <button onClick={() => setSnapshotUrl(null)} className="rounded-full border border-white/20 px-6 py-3 text-xs font-bold uppercase tracking-widest text-white hover:bg-white/10 transition">Retake</button>
+              <button
+                onClick={() => {
+                  setSnapshotUrl(null);
+                  discardEditing();
+                }}
+                className="rounded-full border border-white/20 px-6 py-3 text-xs font-bold uppercase tracking-widest text-white hover:bg-white/10 transition"
+              >
+                Retake
+              </button>
             </div>
           </div>
         </div>

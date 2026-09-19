@@ -7,7 +7,7 @@ import {
   useState,
   ChangeEvent,
 } from "react";
-import { Camera, Download, X } from "lucide-react";
+import { Camera, Download, Smartphone, X } from "lucide-react";
 
 type Flash = { id: string; label: string; url: string };
 type Facing = "user" | "environment";
@@ -17,7 +17,7 @@ const DEFAULT_FLASH: Flash[] = [
   {
     id: "1",
     label: "Blackwork",
-    url: "https://images.unsplash.com/photo-1611501271407-f28c242f3609?auto=format&fit=crop&w=500&q=80",
+    url: "https://images.unsplash.com/photo-1594812332797-bec39ee15b47?auto=format&fit=crop&w=500&q=80",
   },
   {
     id: "2",
@@ -50,6 +50,62 @@ function diffAngle(target: number, current: number) {
   return ((((target - current) % 360) + 540) % 360) - 180;
 }
 
+// Approximates the design wrapping around a cylindrical surface (a forearm,
+// a cheek) instead of sitting flat: the source image is sliced into thin
+// vertical strips, each foreshortened and shaded as if it were a small facet
+// of a curved cross-section, so the outer edges compress and darken as they
+// curve away from camera while the center stays full-bright and full-width.
+function drawWrappedDesign(
+  ctx: CanvasRenderingContext2D,
+  src: HTMLCanvasElement,
+  width: number,
+  height: number,
+  wrapDeg: number,
+  baseAlpha: number
+) {
+  const strips = 32;
+  const wrapRad = Math.max(0.01, (wrapDeg * Math.PI) / 180);
+  const sinMax = Math.sin(wrapRad);
+
+  for (let i = 0; i < strips; i++) {
+    const u0 = (i / strips) * 2 - 1;
+    const u1 = ((i + 1) / strips) * 2 - 1;
+    const uMid = (u0 + u1) / 2;
+    const cosMid = Math.cos(uMid * wrapRad);
+    if (cosMid <= 0.03) continue; // this facet has curved past the visible horizon
+
+    const sx0 = ((u0 + 1) / 2) * src.width;
+    const sx1 = ((u1 + 1) / 2) * src.width;
+    const sw = Math.max(1, sx1 - sx0);
+
+    // Cylindrical unwrap: equal angular slices map to sine-spaced x
+    // positions, which is what makes the edges bunch up and compress.
+    const dx0 = (Math.sin(u0 * wrapRad) / sinMax) * (width / 2);
+    const dx1 = (Math.sin(u1 * wrapRad) / sinMax) * (width / 2);
+    const dw = Math.max(0.5, dx1 - dx0);
+
+    const shade = 0.4 + 0.6 * cosMid;
+
+    ctx.globalAlpha = baseAlpha * shade;
+    ctx.drawImage(src, sx0, 0, sw, src.height, dx0, -height / 2, dw, height);
+  }
+
+  // A soft central sheen sells the curve as glossy skin rather than a flat sticker.
+  const prevOp = ctx.globalCompositeOperation;
+  const prevFilter = ctx.filter;
+  const sheen = ctx.createLinearGradient(-width / 2, 0, width / 2, 0);
+  sheen.addColorStop(0, "rgba(255,255,255,0)");
+  sheen.addColorStop(0.5, `rgba(255,255,255,${0.16 * baseAlpha})`);
+  sheen.addColorStop(1, "rgba(255,255,255,0)");
+  ctx.globalCompositeOperation = "overlay";
+  ctx.filter = "none";
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = sheen;
+  ctx.fillRect(-width / 2, -height / 2, width, height);
+  ctx.globalCompositeOperation = prevOp;
+  ctx.filter = prevFilter;
+}
+
 export default function VirtualTryOn() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -58,11 +114,13 @@ export default function VirtualTryOn() {
   const landmarkerRef = useRef<any>(null);
   const rafRef = useRef<number>(0);
   const lastVideoTimeRef = useRef(-1);
-  const memoryLockRef = useRef<number>(0); 
+  const memoryLockRef = useRef<number>(0);
+  const camRequestIdRef = useRef(0);
 
   const imgCacheRef = useRef<HTMLCanvasElement | null>(null);
   
   // App State
+  const [isMobile, setIsMobile] = useState<boolean | null>(null);
   const [region, setRegion] = useState<Region>("arm");
   const [ready, setReady] = useState(false);
   const [tracking, setTracking] = useState(false);
@@ -90,6 +148,17 @@ export default function VirtualTryOn() {
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
 
   const mirrorVideo = facing === "user";
+
+  // This experience needs a handheld camera pointed at your own body, which a
+  // laptop/desktop webcam can't do — detect that up front and never touch
+  // getUserMedia or download tracking models on non-mobile devices.
+  useEffect(() => {
+    const ua = navigator.userAgent || (navigator as any).vendor || "";
+    const uaMobile = /Android|iPhone|iPad|iPod|Mobile|Windows Phone/i.test(ua);
+    const coarsePointer = window.matchMedia?.("(pointer: coarse)").matches ?? false;
+    const narrowScreen = window.innerWidth <= 900;
+    setIsMobile(uaMobile || (coarsePointer && narrowScreen));
+  }, []);
 
   // Edge-Fade 3D Processor
   useEffect(() => {
@@ -128,6 +197,7 @@ export default function VirtualTryOn() {
 
   // DYNAMIC MODEL LOADER (Triggers when Region changes)
   useEffect(() => {
+    if (isMobile !== true) return;
     let cancelled = false;
     async function init() {
       setReady(false);
@@ -144,19 +214,28 @@ export default function VirtualTryOn() {
         const { FilesetResolver, HandLandmarker, FaceLandmarker } = vision;
         const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
 
+        const createLandmarker = async (delegate: "GPU" | "CPU") => {
+          if (region === "arm") {
+            return HandLandmarker.createFromOptions(fileset, {
+              baseOptions: { modelAssetPath: MODELS.arm, delegate },
+              runningMode: "VIDEO",
+              numHands: 1,
+            });
+          }
+          return FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: MODELS.face, delegate },
+            runningMode: "VIDEO",
+            numFaces: 1,
+          });
+        };
+
         let landmarker: any;
-        if (region === "arm") {
-          landmarker = await HandLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: MODELS.arm, delegate: "GPU" },
-            runningMode: "VIDEO",
-            numHands: 1, 
-          });
-        } else {
-          landmarker = await FaceLandmarker.createFromOptions(fileset, {
-            baseOptions: { modelAssetPath: MODELS.face, delegate: "GPU" },
-            runningMode: "VIDEO",
-            numFaces: 1, 
-          });
+        try {
+          landmarker = await createLandmarker("GPU");
+        } catch {
+          // Many devices/browsers reject the GPU delegate (no WebGL2, driver
+          // blocklist, etc). Retry on CPU before giving up on tracking entirely.
+          landmarker = await createLandmarker("CPU");
         }
 
         if (!cancelled) {
@@ -166,8 +245,10 @@ export default function VirtualTryOn() {
         }
       } catch (e) {
         if (!cancelled) {
-          setError("Tracker failed. Use manual mode.");
-          setStatus("Failed");
+          landmarkerRef.current = null;
+          setError("AI tracker unavailable — switching to manual placement.");
+          setStatus("Manual Mode");
+          setManual(true);
           setReady(true);
         }
       }
@@ -176,11 +257,23 @@ export default function VirtualTryOn() {
     return () => {
       cancelled = true;
     };
-  }, [region]);
+  }, [region, isMobile]);
 
   const startCamera = useCallback(
     async (face: Facing = facing) => {
       setError(null);
+
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setError("Camera not supported in this browser (requires HTTPS + a modern browser).");
+        setTracking(false);
+        return;
+      }
+
+      // Guard against overlapping calls (e.g. rapid camera-switch clicks, or a
+      // dev-mode double effect run) — a stale call's success/failure must never
+      // clobber state set by a call started after it.
+      const reqId = ++camRequestIdRef.current;
+
       try {
         streamRef.current?.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
@@ -189,14 +282,23 @@ export default function VirtualTryOn() {
           video: { facingMode: { ideal: face }, width: { ideal: 1280 }, height: { ideal: 720 } },
           audio: false,
         });
+
+        if (camRequestIdRef.current !== reqId) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+
         streamRef.current = stream;
         const video = videoRef.current;
         if (!video) return;
         video.srcObject = stream;
         await video.play();
+
+        if (camRequestIdRef.current !== reqId) return;
         setTracking(true);
         setStatus("Camera Active");
       } catch {
+        if (camRequestIdRef.current !== reqId) return;
         setError("Camera access denied.");
         setTracking(false);
       }
@@ -204,10 +306,15 @@ export default function VirtualTryOn() {
     [facing]
   );
 
+  // Camera lifecycle is independent of the AI tracker: the feed (and manual
+  // placement) should work even while a model is (re)loading or failed to load.
+  // Gated on isMobile so a desktop visitor is never prompted for camera access.
   useEffect(() => {
-    if (ready) startCamera(facing);
+    if (isMobile !== true) return;
+    startCamera(facing);
     return () => stopCamera();
-  }, [ready, startCamera, stopCamera, facing]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isMobile]);
 
   const switchCamera = async (next: Facing) => {
     if (next === facing) return;
@@ -217,15 +324,18 @@ export default function VirtualTryOn() {
   };
 
   // MULTI-MODEL RENDER LOOP
+  // Runs whenever the camera is tracking, regardless of whether the AI
+  // tracker has finished loading (or failed) — the video feed and manual
+  // placement must keep working either way.
   useEffect(() => {
-    if (!tracking || !landmarkerRef.current) return;
+    if (!tracking) return;
 
     const tick = () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const landmarker = landmarkerRef.current;
 
-      if (!video || !canvas || !landmarker || video.readyState < 2) {
+      if (!video || !canvas || video.readyState < 2) {
         rafRef.current = requestAnimationFrame(tick);
         return;
       }
@@ -238,11 +348,11 @@ export default function VirtualTryOn() {
         canvas.height = video.videoHeight;
       }
 
-      if (video.currentTime !== lastVideoTimeRef.current) {
+      if (landmarker && video.currentTime !== lastVideoTimeRef.current) {
         lastVideoTimeRef.current = video.currentTime;
         try {
           const result = landmarker.detectForVideo(video, performance.now());
-          
+
           let detected = false;
           let targetCx = 0, targetCy = 0, targetAngle = 0, targetLength = 0;
 
@@ -372,11 +482,16 @@ export default function VirtualTryOn() {
           }
 
           ctx.translate(posX, posY);
-          
+
           if (mirrorVideo) ctx.scale(-1, 1);
-          
+
           ctx.rotate(currentAngle);
-          ctx.drawImage(imgCacheRef.current, -targetW / 2, -targetH / 2, targetW, targetH);
+
+          // Band designs wrap most of the way around a limb's circumference;
+          // a portrait-style piece still sits on a rounded surface, so it
+          // gets a gentler curve; a face gets the cheek's curvature.
+          const wrapDeg = region === "face" ? 42 : isBand ? 78 : 26;
+          drawWrappedDesign(ctx, imgCacheRef.current, targetW, targetH, wrapDeg, opacity);
           ctx.restore();
         }
       }
@@ -386,7 +501,7 @@ export default function VirtualTryOn() {
 
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);
-  }, [tracking, manual, mirrorVideo, pose, manualPos, rotOffset, scaleMul, opacity, placementOffset, region]);
+  }, [tracking, ready, manual, mirrorVideo, pose, manualPos, rotOffset, scaleMul, opacity, placementOffset, region]);
 
   const onDesignUpload = (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -398,15 +513,48 @@ export default function VirtualTryOn() {
 
   const captureSnapshot = () => {
     const canvas = canvasRef.current;
-    if (canvas) {
+    if (!canvas) return;
+    try {
       setSnapshotUrl(canvas.toDataURL("image/png"));
+    } catch {
+      setError("Couldn't capture this design (image failed CORS check). Try another design or upload your own.");
     }
   };
+
+  // Still checking the device on first client render — avoid flashing the
+  // full camera UI before we know whether to show the desktop notice.
+  if (isMobile === null) {
+    return <section className="relative z-10 min-h-[100svh] bg-black pb-16 pt-20 sm:pt-24" />;
+  }
+
+  if (isMobile === false) {
+    return (
+      <section className="relative z-10 min-h-[100svh] bg-black pb-16 pt-20 text-white sm:pt-24">
+        <div className="mx-auto max-w-2xl px-4 text-center sm:px-6">
+          <p className="mb-1 text-[10px] uppercase tracking-[0.35em] text-white/50">
+            Augmented Reality Studio
+          </p>
+          <h1 className="mb-6 text-2xl font-black uppercase tracking-tight sm:text-3xl md:text-4xl">
+            Live Stencil Preview
+          </h1>
+          <div className="mx-auto flex max-w-md flex-col items-center gap-4 rounded-2xl border border-white/10 bg-white/5 p-8 backdrop-blur-md">
+            <Smartphone size={40} className="text-white/60" />
+            <p className="text-sm text-white/80">
+              Live AR try-on needs a handheld camera pointed at your own arm, face, or shoulder — it only works on phones and tablets.
+            </p>
+            <p className="text-xs text-white/50">
+              Open this page on your mobile device to try designs on in real time.
+            </p>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="relative z-10 min-h-[100svh] bg-black pb-16 pt-20 text-white sm:pt-24">
       <div className="mx-auto max-w-5xl px-4 sm:px-6">
-        
+
         {/* HEADER */}
         <div className="mb-6 text-center">
           <p className="mb-1 text-[10px] uppercase tracking-[0.35em] text-white/50">

@@ -24,8 +24,7 @@ export const IMG = {
   handsClose: u("photo-1761276297686-f507ca9fe8b6", 1600, 1200),
   monoProcess: u("photo-1552627019-947c3789ffb5", 1600, 1200),
   blackworkDetail: u("photo-1562962230-16e4623d36e6", 1400, 1600),
-  fineLine: u("photo-1611501271407-f28c242f3609", 1400, 1600),
-  realism: u("photo-1572915858631-c49b068a74e5", 1400, 1600),
+  fineLine: u("photo-1665085326630-b01fea9a613d", 1400, 1600),
 };
 
 export const styles = [

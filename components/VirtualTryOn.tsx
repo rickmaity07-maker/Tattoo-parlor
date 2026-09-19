@@ -20,8 +20,8 @@ type Region = "arm" | "face";
 const DEFAULT_FLASH: Flash[] = [
   {
     id: "1",
-    label: "Fine Line",
-    url: "https://images.unsplash.com/photo-1712686421453-444a1e1ebe5d?auto=format&fit=crop&w=500&q=80",
+    label: "Script",
+    url: "https://images.unsplash.com/photo-1725918128612-6021dbe24add?auto=format&fit=crop&w=500&q=80",
   },
   {
     id: "2",
@@ -47,80 +47,174 @@ type BodyPose = {
 const MODELS = {
   arm: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
   face: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+  // Segments a photo into background / hair / body-skin / face-skin /
+  // clothes / other. Used to strip a candid tattoo photo's surroundings
+  // (a wall, a floor, clothing) before background-color keying — Apache-2.0,
+  // same vendor as the trackers above, no new dependency.
+  segmenter:
+    "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite",
 };
 const WASM_ROOT = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm";
+
+// selfie_multiclass_256x256 category indices.
+const SEGMENT_CATEGORY = { background: 0, hair: 1, bodySkin: 2, faceSkin: 3, clothes: 4, other: 5 };
 
 function diffAngle(target: number, current: number) {
   return ((((target - current) % 360) + 540) % 360) - 180;
 }
 
-// Turns a flash-art photo (ink on a white/off-white/studio-card backdrop)
-// into a clean transparent stencil. Earlier this relied on the "multiply"
-// blend mode alone to hide a white background, which only works if the
-// backdrop is pure white — any off-white, cream, or textured card leaves a
-// visible rectangle. Instead we sample the image's own border to learn what
-// its actual background color is, then key out anything close to it,
-// leaving only the ink opaque (with a soft ramp so edges anti-alias instead
-// of looking cut with scissors).
-function extractInkStencil(img: HTMLImageElement): HTMLCanvasElement {
+function loadImage(url: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error(`Failed to load image: ${url}`));
+    img.src = url;
+  });
+}
+
+function drawToCanvas(img: HTMLImageElement): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
   canvas.width = img.naturalWidth || img.width;
   canvas.height = img.naturalHeight || img.height;
   const ctx = canvas.getContext("2d");
-  if (!ctx) return canvas;
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  if (ctx) ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
 
+// Uses MediaPipe's selfie-multiclass segmenter to drop everything in a
+// candid tattoo photo that isn't skin (walls, floors, clothes, hair),
+// mutating the canvas's alpha channel in place. Best-effort: any failure
+// (model still loading, decode error) just leaves the canvas untouched.
+function applySkinSegmentation(canvas: HTMLCanvasElement, segmenter: any) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  const result = segmenter.segment(canvas);
   try {
-    const { width, height } = canvas;
-    const imageData = ctx.getImageData(0, 0, width, height);
+    const mask = result.categoryMask;
+    if (!mask) return;
+    const categories = mask.getAsUint8Array();
+    const maskW = mask.width, maskH = mask.height;
+
+    // A flash-sheet illustration (no photographed person in it at all) will
+    // read as "no skin detected anywhere" — trusting the mask in that case
+    // would wipe the entire design to transparent. Only apply it once
+    // there's a real, sizeable skin region to work with.
+    let skinPixels = 0;
+    for (let i = 0; i < categories.length; i++) {
+      if (categories[i] === SEGMENT_CATEGORY.bodySkin || categories[i] === SEGMENT_CATEGORY.faceSkin) {
+        skinPixels++;
+      }
+    }
+    if (skinPixels / categories.length < 0.08) return;
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const px = imageData.data;
 
-    const borderR: number[] = [], borderG: number[] = [], borderB: number[] = [];
-    const sample = (x: number, y: number) => {
-      const i = (y * width + x) * 4;
-      borderR.push(px[i]);
-      borderG.push(px[i + 1]);
-      borderB.push(px[i + 2]);
-    };
-    const step = Math.max(1, Math.floor(Math.min(width, height) / 80));
-    for (let x = 0; x < width; x += step) {
-      sample(x, 0);
-      sample(x, height - 1);
-    }
-    for (let y = 0; y < height; y += step) {
-      sample(0, y);
-      sample(width - 1, y);
-    }
-    const n = borderR.length;
-    const bgR = borderR.reduce((a, b) => a + b, 0) / n;
-    const bgG = borderG.reduce((a, b) => a + b, 0) / n;
-    const bgB = borderB.reduce((a, b) => a + b, 0) / n;
-
-    // If the border itself isn't a fairly consistent color, there's no flat
-    // backdrop to key against — likely a candid photo (skin, hair, a room)
-    // rather than flash art on a card. Keying against a border average that
-    // doesn't mean anything would carve the image up arbitrarily, so leave
-    // it untouched instead of making it worse.
-    let variance = 0;
-    for (let i = 0; i < n; i++) {
-      variance += (borderR[i] - bgR) ** 2 + (borderG[i] - bgG) ** 2 + (borderB[i] - bgB) ** 2;
-    }
-    const borderSpread = Math.sqrt(variance / n);
-    if (borderSpread > 45) {
-      return canvas;
-    }
-
-    for (let i = 0; i < px.length; i += 4) {
-      const r = px[i], g = px[i + 1], b = px[i + 2];
-      const dist = Math.sqrt((r - bgR) ** 2 + (g - bgG) ** 2 + (b - bgB) ** 2);
-      const alpha = Math.max(0, Math.min(255, (dist - 16) * 6));
-      px[i + 3] = Math.min(px[i + 3], Math.round(alpha));
+    for (let y = 0; y < canvas.height; y++) {
+      const my = Math.min(maskH - 1, Math.floor((y / canvas.height) * maskH));
+      const rowBase = my * maskW;
+      for (let x = 0; x < canvas.width; x++) {
+        const mx = Math.min(maskW - 1, Math.floor((x / canvas.width) * maskW));
+        const cat = categories[rowBase + mx];
+        if (cat !== SEGMENT_CATEGORY.bodySkin && cat !== SEGMENT_CATEGORY.faceSkin) {
+          px[(y * canvas.width + x) * 4 + 3] = 0;
+        }
+      }
     }
     ctx.putImageData(imageData, 0, 0);
+  } finally {
+    result.close?.();
+  }
+}
+
+// Turns whatever's left (flash-art on a flat card, or a photo already
+// trimmed to just skin by applySkinSegmentation) into a clean transparent
+// stencil. Finds the dominant color among still-opaque pixels — the card's
+// backdrop, or the skin tone once the room's been segmented out — and keys
+// it to transparent with a soft ramp, leaving only the ink opaque. Skips
+// pixels already made transparent by an earlier stage, and bails out if no
+// single color clearly dominates (a busy, un-segmentable photo) rather than
+// carving the image up arbitrarily.
+function keyOutDominantColor(canvas: HTMLCanvasElement) {
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  const { width, height } = canvas;
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const px = imageData.data;
+
+  // Wider buckets tolerate the natural grain/shading gradient a photographed
+  // paper backdrop has (16 splits that noise across too many buckets for any
+  // one to read as "dominant"); tuned against real flash-card photos and
+  // candid tattoo-on-skin photos so the two cleanly separate at the 0.3
+  // share threshold below.
+  const QUANT = 24;
+  const buckets = new Map<number, { r: number; g: number; b: number; count: number }>();
+  let totalOpaque = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 10) continue;
+    const r = px[i], g = px[i + 1], b = px[i + 2];
+    const key =
+      (Math.floor(r / QUANT) << 16) | (Math.floor(g / QUANT) << 8) | Math.floor(b / QUANT);
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = { r: 0, g: 0, b: 0, count: 0 };
+      buckets.set(key, bucket);
+    }
+    bucket.r += r;
+    bucket.g += g;
+    bucket.b += b;
+    bucket.count++;
+    totalOpaque++;
+  }
+  if (totalOpaque === 0) return;
+
+  let dominant: { r: number; g: number; b: number; count: number } | null = null;
+  for (const bucket of buckets.values()) {
+    if (!dominant || bucket.count > dominant.count) dominant = bucket;
+  }
+  if (!dominant || dominant.count / totalOpaque < 0.3) return;
+
+  const bgR = dominant.r / dominant.count;
+  const bgG = dominant.g / dominant.count;
+  const bgB = dominant.b / dominant.count;
+
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 10) continue;
+    const r = px[i], g = px[i + 1], b = px[i + 2];
+    const dist = Math.sqrt((r - bgR) ** 2 + (g - bgG) ** 2 + (b - bgB) ** 2);
+    const alpha = Math.max(0, Math.min(255, (dist - 16) * 6));
+    px[i + 3] = Math.min(px[i + 3], Math.round(alpha));
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+// Full background-removal pipeline for a design image: best-effort ML skin
+// segmentation (strips a candid photo's surroundings), then color-key
+// whatever's left down to just the ink. Each stage is independently
+// best-effort — a failure at either just leaves the previous stage's result.
+async function buildDesignStencil(
+  url: string,
+  getSegmenter: () => Promise<any | null>
+): Promise<HTMLCanvasElement> {
+  const img = await loadImage(url);
+  const canvas = drawToCanvas(img);
+
+  try {
+    const segmenter = await getSegmenter();
+    if (segmenter) applySkinSegmentation(canvas, segmenter);
+  } catch {
+    // Segmentation is a nice-to-have, not required — fall through.
+  }
+
+  try {
+    keyOutDominantColor(canvas);
   } catch {
     // A cross-origin source without CORS headers taints the canvas and
-    // blocks pixel access — fall back to the un-keyed image rather than
-    // throwing; the multiply blend still hides a plain white backdrop.
+    // blocks pixel access — leave the (possibly already skin-segmented)
+    // image as-is rather than throwing.
   }
 
   return canvas;
@@ -211,6 +305,7 @@ export default function VirtualTryOn() {
 
   const imgCacheRef = useRef<HTMLCanvasElement | null>(null);
   const frozenFrameRef = useRef<HTMLCanvasElement | null>(null);
+  const segmenterPromiseRef = useRef<Promise<any | null> | null>(null);
 
   // App State
   const [isMobile, setIsMobile] = useState<boolean | null>(null);
@@ -245,6 +340,8 @@ export default function VirtualTryOn() {
   // placement can be fine-tuned after the shot instead of only before it.
   const [editing, setEditing] = useState(false);
 
+  const [designProcessing, setDesignProcessing] = useState(false);
+
   const mirrorVideo = facing === "user";
 
   // This experience needs a handheld camera pointed at your own body, which a
@@ -258,24 +355,65 @@ export default function VirtualTryOn() {
     setIsMobile(uaMobile || (coarsePointer && narrowScreen));
   }, []);
 
-  // Background-removal pipeline: key the flash-art photo down to just its
-  // ink (see extractInkStencil). The per-frame cylindrical wrap render
-  // handles edge fade/shading dynamically now, so this step is purely about
-  // getting a clean cutout, not baking in a directional fade.
+  // Lazily creates (once) and caches the skin segmenter used by the
+  // background-removal pipeline below. Only fetched when actually needed —
+  // never on desktop, where the try-on UI isn't shown at all.
+  const getSegmenter = useCallback(() => {
+    if (!segmenterPromiseRef.current) {
+      segmenterPromiseRef.current = (async () => {
+        try {
+          const vision = await import("@mediapipe/tasks-vision");
+          const { FilesetResolver, ImageSegmenter } = vision;
+          const fileset = await FilesetResolver.forVisionTasks(WASM_ROOT);
+          const create = (delegate: "GPU" | "CPU") =>
+            ImageSegmenter.createFromOptions(fileset, {
+              baseOptions: { modelAssetPath: MODELS.segmenter, delegate },
+              runningMode: "IMAGE",
+              outputCategoryMask: true,
+              outputConfidenceMasks: false,
+            });
+          try {
+            return await create("GPU");
+          } catch {
+            return await create("CPU");
+          }
+        } catch {
+          return null;
+        }
+      })();
+    }
+    return segmenterPromiseRef.current;
+  }, []);
+
   useEffect(() => {
-    if (!activeUrl) return;
-    let cancelled = false;
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.src = activeUrl;
-    img.onload = () => {
-      if (cancelled) return;
-      imgCacheRef.current = extractInkStencil(img);
+    return () => {
+      segmenterPromiseRef.current?.then((s) => s?.close?.());
     };
+  }, []);
+
+  // Background-removal pipeline: best-effort ML skin segmentation, then key
+  // out whatever's left down to just the ink (see buildDesignStencil). The
+  // per-frame cylindrical wrap render handles edge fade/shading dynamically,
+  // so this step is purely about getting a clean cutout.
+  useEffect(() => {
+    if (!activeUrl || isMobile !== true) return;
+    let cancelled = false;
+    setDesignProcessing(true);
+    buildDesignStencil(activeUrl, getSegmenter)
+      .then((canvas) => {
+        if (cancelled) return;
+        imgCacheRef.current = canvas;
+      })
+      .catch(() => {
+        if (!cancelled) setError("Couldn't process that design. Try another one.");
+      })
+      .finally(() => {
+        if (!cancelled) setDesignProcessing(false);
+      });
     return () => {
       cancelled = true;
     };
-  }, [activeUrl]);
+  }, [activeUrl, isMobile, getSegmenter]);
 
   const stopCamera = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
@@ -824,7 +962,7 @@ export default function VirtualTryOn() {
         <div className="mx-auto mt-6 max-w-2xl">
           <div className="mb-3 flex items-center justify-between">
             <p className="text-[10px] uppercase tracking-[0.25em] text-white/50">
-              Select Flash or Upload Ink
+              {designProcessing ? "Removing background…" : "Select Flash or Upload Ink"}
             </p>
             <label className="cursor-pointer rounded-full border border-white/20 px-4 py-2 text-[10px] font-bold uppercase tracking-widest hover:border-white/60 transition">
               Upload Design
